@@ -213,32 +213,93 @@ MAX_RISK_PER_TRADE = 5
 
 NO_REALTIME_DATA_NO_TRADE = True
 
+
 # =====================================
 # DATA SOURCES
 # =====================================
 
-PRIMARY_DATA_SOURCE = "POLYGON"
+PRIMARY_DATA_SOURCE = "MASSIVE"
 
-SECONDARY_DATA_SOURCE = "ALPACA"
+SECONDARY_DATA_SOURCE = "FINNHUB"
 
-THIRD_DATA_SOURCE = "TRADIER"
+THIRD_DATA_SOURCE = "FMP"
 
-FOURTH_DATA_SOURCE = "IBKR"
+FOURTH_DATA_SOURCE = "ALPHA_VANTAGE"
 
 # =====================================
 # API KEYS
 # =====================================
 
-POLYGON_API_KEY = ""
+MASSIVE_API_KEY = "kddwFWHDr_6K5B3TFjrlYFtpI1jmnfsV"
 
-ALPACA_API_KEY = ""
+FINNHUB_API_KEY = "d8o53l1r01qvtr6mk6j0d8o53l1r01qvtr6mk6jg"
 
-ALPACA_SECRET_KEY = ""
+FMP_API_KEY = "WzZgK7341EU6gJ6ALUXv7ALgSZbXZkb7"
 
-TRADIER_API_KEY = ""
+ALPHA_VANTAGE_API_KEY = "HI2H7AAL8JRX115F"
 
-IBKR_HOST = "127.0.0.1"
+# =====================================
+# SOURCE CONTROL
+# =====================================
 
-IBKR_PORT = 7497
+USE_MASSIVE = True
 
+USE_FINNHUB = True
 
+USE_FMP = True
+
+USE_ALPHA_VANTAGE = True
+
+ENABLE_SOURCE_FALLBACK = True
+
+# =====================================
+# SOURCE FEATURES
+# =====================================
+
+USE_REALTIME_DATA = True
+
+USE_OPTIONS_DATA = True
+
+USE_NEWS_DATA = True
+
+USE_FUNDAMENTALS = True
+
+# =====================================
+# OPTIONS DATA
+# =====================================
+
+USE_MASSIVE_OPTIONS = True
+
+# =====================================
+# NEWS DATA
+# =====================================
+
+USE_FINNHUB_NEWS = True
+
+# =====================================
+# FUNDAMENTALS
+# =====================================
+
+USE_FMP_FUNDAMENTALS = True
+
+# =====================================
+# BACKUP DATA
+# =====================================
+
+USE_ALPHA_VANTAGE_BACKUP = True
+
+# =====================================
+# DATA PROTECTION
+# =====================================
+
+NO_REALTIME_DATA_NO_TRADE = True
+
+# =====================================
+# FUTURE SOURCES
+# =====================================
+
+ENABLE_TRADIER = False
+
+ENABLE_ALPACA = False
+
+ENABLE_IBKR = False
