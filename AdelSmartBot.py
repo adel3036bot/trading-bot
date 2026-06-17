@@ -14,7 +14,8 @@ from config import WATCHLIST
 from trade_manager import update_trade
 from telegram_bot.telegram_engine import TelegramEngine
 
-
+market_cache = None
+market_cache_time = None
 
 # ==================================================
 # MARKET FUNCTIONS
@@ -573,10 +574,15 @@ def get_market_regime():
 def get_signal_score(symbol):
 
     try:
-
+global market_cache
+global market_cache_time
         score = 0
 
-        market = get_market_regime()
+        if market_cache is None:
+
+    market_cache = get_market_regime()
+
+market = market_cache
 
         print("START:", symbol)
         print("MARKET:", market)
@@ -1165,6 +1171,21 @@ def get_signal_score(symbol):
 
         print("REVERSAL CANDLE =", reversal_candle)
 
+# Trend Alignment
+if trend_alignment:
+    pullback_score += 30
+
+# Healthy RSI
+if healthy_rsi:
+    pullback_score += 25
+
+# Volume Pullback
+if volume_pullback:
+    pullback_score += 20
+
+# Reversal Candle
+if reversal_candle:
+    pullback_score += 25
 
         print("PULLBACK SCORE =", pullback_score)
 
