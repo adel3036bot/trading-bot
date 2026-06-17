@@ -288,6 +288,16 @@ def create_trade(symbol):
 
     signal_type = get_trend(symbol)
 
+    score_data = get_signal_score(symbol)
+
+    confidence = score_data["confidence"]
+
+    score = score_data["score"]
+
+    if confidence == "NO TRADE":
+
+        return None
+
     option_data = get_best_option(
         symbol,
         signal_type
@@ -304,16 +314,6 @@ def create_trade(symbol):
     expiry = option_data["expiry"]
 
     contract_symbol = option_data["contract_symbol"]
-
-    score_data = get_signal_score(symbol)
-
-    confidence = score_data["confidence"]
-
-    score = score_data["score"]
-
-    if confidence == "NO TRADE":
-
-        return None
 
     return {
 
@@ -354,8 +354,6 @@ def create_trade(symbol):
         )
 
     }
-
-    
 
 # ==================================================
 # SIGNAL SCORE ENGINE
@@ -565,24 +563,40 @@ def get_market_regime():
         }
 
 
+# ==================================================
+# MARKET CACHE
+# ==================================================
 
+def get_cached_market():
 
-        # ==================================================
+    global market_cache
+    global market_cache_time
+
+    now = datetime.now()
+
+    if (
+        market_cache is None
+        or market_cache_time is None
+        or (now - market_cache_time).seconds > 300
+    ):
+
+        market_cache = get_market_regime()
+
+        market_cache_time = now
+
+    return market_cache
+    
+# ==================================================
 # REAL SCORE ENGINE
 # ==================================================
 
 def get_signal_score(symbol):
 
     try:
-global market_cache
-global market_cache_time
+
         score = 0
 
-        if market_cache is None:
-
-    market_cache = get_market_regime()
-
-market = market_cache
+        market = get_cached_market()
 
         print("START:", symbol)
         print("MARKET:", market)
@@ -1126,8 +1140,7 @@ market = market_cache
 
             trend_alignment = True
 
-
-        # ==================
+# ==================
         # HEALTHY RSI
         # ==================
 
@@ -1137,7 +1150,7 @@ market = market_cache
 
             healthy_rsi = True
 
-# ==================
+        # ==================
         # VOLUME PULLBACK
         # ==================
 
@@ -1147,7 +1160,7 @@ market = market_cache
 
             volume_pullback = True
 
-# ==================
+        # ==================
         # REVERSAL CANDLE
         # ==================
 
@@ -1171,21 +1184,25 @@ market = market_cache
 
         print("REVERSAL CANDLE =", reversal_candle)
 
-# Trend Alignment
-if trend_alignment:
-    pullback_score += 30
+        # Trend Alignment
+        if trend_alignment:
 
-# Healthy RSI
-if healthy_rsi:
-    pullback_score += 25
+            pullback_score += 30
 
-# Volume Pullback
-if volume_pullback:
-    pullback_score += 20
+        # Healthy RSI
+        if healthy_rsi:
 
-# Reversal Candle
-if reversal_candle:
-    pullback_score += 25
+            pullback_score += 25
+
+        # Volume Pullback
+        if volume_pullback:
+
+            pullback_score += 20
+
+        # Reversal Candle
+        if reversal_candle:
+
+            pullback_score += 25
 
         print("PULLBACK SCORE =", pullback_score)
 
@@ -1194,7 +1211,7 @@ if reversal_candle:
         )
 
         print("AFTER PULLBACK =", score)
-
+     
 # ==================
         # BULL FLAG LAYER
         # ==================
@@ -1244,7 +1261,14 @@ if reversal_candle:
         if "CALL" in trend:
 
             score += 10
+        # ==================
+        # SCORE LIMIT
+        # ==================
 
+        score = min(
+            score,
+            100
+        )
         print("FINAL SCORE =", score)
 
         if score >= 90:
@@ -1381,15 +1405,4 @@ if __name__ == "__main__":
             time.sleep(60)
 
             
-
-
-
-
-
-
-
-
-
-
-
-
+            
