@@ -77,9 +77,7 @@ def get_option_expiry(symbol):
             return None
 
         weekly_expiry = None
-
         daily_expiry = None
-
         swing_expiry = None
 
         today = datetime.now().date()
@@ -99,33 +97,27 @@ def get_option_expiry(symbol):
             if 5 <= days <= 10:
 
                 if weekly_expiry is None:
-
                     weekly_expiry = expiry
 
             # Daily
             elif 0 <= days <= 3:
 
                 if daily_expiry is None:
-
                     daily_expiry = expiry
 
             # Swing
             elif 14 <= days <= 30:
 
                 if swing_expiry is None:
-
                     swing_expiry = expiry
 
         if weekly_expiry:
-
             return weekly_expiry
 
         if daily_expiry:
-
             return daily_expiry
 
         if swing_expiry:
-
             return swing_expiry
 
         return expiries[0]
@@ -134,6 +126,10 @@ def get_option_expiry(symbol):
 
         return None
 
+
+# ==================================================
+# CONTRACT SELECTION ENGINE V1
+# ==================================================
 
 def get_best_option(symbol, signal_type):
 
@@ -159,66 +155,121 @@ def get_best_option(symbol, signal_type):
         else:
             options = chain.puts
 
+        # إزالة العقود الضعيفة
         options = options[
             (options["openInterest"] > 0)
-            & (options["volume"] > 0)
+            &
+            (options["volume"] > 0)
         ]
 
         if len(options) == 0:
             return None
 
-        price_ranges = [
-            (1, 3),
-            (3, 6),
-            (6, 10),
-            (10, 15)
+        # ==================================================
+        # STRIKE FILTER
+        # ==================================================
+
+        index_symbols = [
+            "SPY",
+            "QQQ",
+            "SPX"
         ]
 
-        for min_price, max_price in price_ranges:
+        if symbol in index_symbols:
+            max_distance_percent = 0.05
+        else:
+            max_distance_percent = 0.10
 
-            tier_options = options[
-                (options["lastPrice"] >= min_price)
-                & (options["lastPrice"] <= max_price)
+        if "CALL" in signal_type:
+
+            options = options[
+                (options["strike"] >= current_price)
+                &
+                (
+                    options["strike"]
+                    <= current_price *
+                    (
+                        1 + max_distance_percent
+                    )
+                )
             ]
 
-            if len(tier_options) == 0:
-                continue
+        else:
 
-            tier_options = tier_options.copy()
+            options = options[
+                (options["strike"] <= current_price)
+                &
+                (
+                    options["strike"]
+                    >= current_price *
+                    (
+                        1 - max_distance_percent
+                    )
+                )
+            ]
 
-            tier_options["distance"] = (
-                tier_options["strike"]
-                - current_price
-            ).abs()
+        if len(options) == 0:
+            return None
 
-            tier_options["score"] = (
-                tier_options["openInterest"] * 0.30
-                + tier_options["volume"] * 0.25
-                - tier_options["distance"] * 10
-            )
+        # ==================================================
+        # CONTRACT PRICE FILTER
+        # ==================================================
 
-            tier_options = tier_options.sort_values(
-                by="score",
-                ascending=False
-            )
+        options = options[
+            (options["lastPrice"] >= 1)
+            &
+            (options["lastPrice"] <= 10)
+        ]
 
-            best = tier_options.iloc[0]
+        if len(options) == 0:
+            return None
 
-            return {
-                "contract_symbol": str(
-                    best["contractSymbol"]
-                ),
-                "strike": float(
-                    best["strike"]
-                ),
-                "option_price": round(
-                    float(best["lastPrice"]),
-                    2
-                ),
-                "expiry": expiry
-            }
+        options = options.copy()
 
-        return None
+        # ==================================================
+        # DISTANCE
+        # ==================================================
+
+        options["distance"] = (
+            options["strike"]
+            - current_price
+        ).abs()
+# ==================================================
+# CONTRACT SCORE
+# ==================================================
+
+        options["score"] = (
+            (1 / (options["distance"] + 1)) * 35
+            +
+            options["openInterest"] * 0.002
+            +
+            options["volume"] * 0.003
+        )
+
+        options = options.sort_values(
+            by="score",
+            ascending=False
+        )
+
+        best = options.iloc[0]
+
+        # ==================================================
+        # CREATE TRADE
+        # ==================================================
+
+        return {
+            "contract_symbol": str(
+                best["contractSymbol"]
+            ),
+            "strike": float(
+                best["strike"]
+            ),
+            "option_price": round(
+                float(best["lastPrice"]),
+                2
+            ),
+            "expiry": expiry
+        }
 
     except Exception as e:
 
@@ -228,8 +279,6 @@ def get_best_option(symbol, signal_type):
         )
 
         return None
-
-        
    # ==================================================
 # CREATE TRADE
 # ==================================================
