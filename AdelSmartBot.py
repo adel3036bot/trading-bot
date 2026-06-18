@@ -254,22 +254,40 @@ def get_best_option(symbol, signal_type):
 
         best = options.iloc[0]
 
-        # ==================================================
+       # ==================================================
         # CREATE TRADE
         # ==================================================
 
         return {
+
             "contract_symbol": str(
                 best["contractSymbol"]
             ),
+
             "strike": float(
                 best["strike"]
             ),
+
             "option_price": round(
                 float(best["lastPrice"]),
                 2
             ),
-            "expiry": expiry
+
+            "expiry": expiry,
+
+            "open_interest": int(
+                best["openInterest"]
+            ),
+
+            "volume": int(
+                best["volume"]
+            ),
+
+            "distance": round(
+                float(best["distance"]),
+                2
+            )
+
         }
 
     except Exception as e:
@@ -280,7 +298,162 @@ def get_best_option(symbol, signal_type):
         )
 
         return None
-   # ==================================================
+        
+# ==================================================
+# CONTRACT RATING ENGINE
+# ==================================================
+
+def get_contract_rating(
+    option_price,
+    open_interest,
+    volume,
+    distance
+):
+
+    score = 0
+
+    # ==================
+    # PRICE QUALITY
+    # ==================
+
+    if 0.5 <= option_price <= 5:
+
+        score += 35
+
+    elif option_price <= 10:
+
+        score += 25
+
+    else:
+
+        score += 10
+
+    # ==================
+    # OPEN INTEREST
+    # ==================
+
+    if open_interest >= 1000:
+
+        score += 30
+
+    elif open_interest >= 500:
+
+        score += 20
+
+    elif open_interest >= 100:
+
+        score += 10
+
+    # ==================
+    # VOLUME
+    # ==================
+
+    if volume >= 300:
+
+        score += 20
+
+    elif volume >= 150:
+
+        score += 15
+
+    elif volume >= 50:
+
+        score += 10
+
+    # ==================
+    # DISTANCE
+    # ==================
+
+    if distance <= 3:
+
+        score += 15
+
+    elif distance <= 5:
+
+        score += 10
+
+    else:
+
+        score += 5
+
+    # ==================
+    # RATING
+    # ==================
+
+    if score >= 90:
+
+        return "A+"
+
+    elif score >= 75:
+
+        return "A"
+
+    elif score >= 60:
+
+        return "B"
+
+    return "WEAK"
+
+# ==================================================
+# FINAL APPROVAL ENGINE
+# ==================================================
+
+def final_approval(
+    stock_rating,
+    contract_rating
+):
+
+    # ==================
+    # ELITE
+    # ==================
+
+    if (
+        stock_rating == "A+"
+        and
+        contract_rating == "A+"
+    ):
+
+        return "SEND"
+
+    # ==================
+    # STRONG
+    # ==================
+
+    if (
+        stock_rating in ["A+", "A"]
+        and
+        contract_rating in ["A+", "A"]
+    ):
+
+        return "SEND"
+
+    # ==================
+    # ACCEPTABLE
+    # ==================
+
+    if (
+        stock_rating == "A"
+        and
+        contract_rating == "B"
+    ):
+
+        return "ALLOW"
+
+    # ==================
+    # WEAK CONTRACT
+    # ==================
+
+    if contract_rating == "WEAK":
+
+        return "NO TRADE"
+
+    # ==================
+    # DEFAULT
+    # ==================
+
+    return "NO TRADE"
+
+# ==================================================
 # CREATE TRADE
 # ==================================================
 
@@ -315,6 +488,40 @@ def create_trade(symbol):
 
     contract_symbol = option_data["contract_symbol"]
 
+   # ==================================================
+    # CONTRACT RATING
+    # ==================================================
+
+    contract_rating = get_contract_rating(
+        entry,
+        option_data["open_interest"],
+        option_data["volume"],
+        option_data["distance"]
+    )
+
+    # ==================================================
+    # FINAL APPROVAL
+    # ==================================================
+
+    approval = final_approval(
+        confidence,
+        contract_rating
+    )
+
+    print(
+        "CONTRACT RATING =",
+        contract_rating
+    )
+
+    print(
+        "FINAL APPROVAL =",
+        approval
+    )
+
+    if approval == "NO TRADE":
+
+        return None
+
     return {
 
         "symbol": symbol,
@@ -331,17 +538,33 @@ def create_trade(symbol):
 
         "confidence": confidence,
 
+        "contract_rating": contract_rating,
+
+        "approval": approval,
+
         "trade_type": "Real Option",
 
         "expiry": expiry,
 
-        "tp1": round(entry * 1.3, 2),
+        "tp1": round(
+            entry * 1.3,
+            2
+        ),
 
-        "tp2": round(entry * 1.6, 2),
+        "tp2": round(
+            entry * 1.6,
+            2
+        ),
 
-        "tp3": round(entry * 2.0, 2),
+        "tp3": round(
+            entry * 2.0,
+            2
+        ),
 
-        "sl": round(entry * 0.7, 2),
+        "sl": round(
+            entry * 0.7,
+            2
+        ),
 
         "status": "NEW",
 
@@ -354,7 +577,6 @@ def create_trade(symbol):
         )
 
     }
-
 # ==================================================
 # SIGNAL SCORE ENGINE
 # ==================================================
