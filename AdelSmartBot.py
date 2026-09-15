@@ -1,305 +1,178 @@
 # ==================================================
-# ADEL SMART BOT V2
+# ADEL SMART BOT V2.1 - PRODUCTION READY
 # ==================================================
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes
+)
 
-from datetime import datetime, timedelta
+from datetime import (
+    datetime,
+    timedelta,
+    time
+)
 
-import yfinance as yf
 import random
-from config import WATCHLIST
+import time
+import threading
+import pandas as pd
+
+# ==================================================
+# CONFIG
+# ==================================================
+
+from config import (
+    WATCHLIST,
+
+    BOT_TOKEN,
+    CHAT_ID,
+    CHANNEL_URL,
+    ADMIN_ID,
+
+    MIN_OPTION_PRICE,
+    MAX_OPTION_PRICE,
+
+    CONFIDENCE_A_PLUS,
+    CONFIDENCE_A,
+    CONFIDENCE_B
+)
+
+# ==================================================
+# TRADE MANAGER
+# ==================================================
 
 from trade_manager import update_trade
+
+# ==================================================
+# SCHEDULER
+# ==================================================
+
+from daily_scheduler import DailyScheduler
+
+# ==================================================
+# TELEGRAM ENGINE
+# ==================================================
+
 from telegram_bot.telegram_engine import TelegramEngine
+from telegram_bot.telegram_app import TelegramApp
+
+# ==================================================
+# MARKET DATA ENGINES
+# ==================================================
+
+from market.data_engine import (
+    get_stock_data,
+    get_option_chain_data,
+    get_vix_data,
+    get_gold_data,
+    get_crypto_data
+)
+
+# ==================================================
+# NEWS ENGINE (NEW SYSTEM)
+# ==================================================
+
+from news.news_engine import NewsEngine
+
+
+# ==================================================
+# GLOBAL CACHE
+# ==================================================
 
 market_cache = None
 market_cache_time = None
+
+sent_signals = set()
 
 # ==================================================
 # MARKET FUNCTIONS
 # ==================================================
 
 def get_stock_price(symbol):
-
     try:
-        stock = yf.Ticker(symbol)
-
-        data = stock.history(period="1d")
-
-        if not data.empty:
-            return round(data["Close"].iloc[-1], 2)
-
-    except Exception:
-        pass
-
+        data = get_stock_data(symbol)
+        if data is not None and not data.empty:
+            return round(float(data["Close"].iloc[-1]), 2)
+    except: pass
     return None
 
-
 def get_trend(symbol):
-
     try:
-        stock = yf.Ticker(symbol)
-
-        data = stock.history(period="5d")
-
-        if len(data) >= 2:
-
-            first_close = data["Close"].iloc[0]
-            last_close = data["Close"].iloc[-1]
-
-            if last_close > first_close:
-                return "CALL 📈"
-
-            return "PUT 📉"
-
-    except Exception:
-        pass
-
-    return random.choice([
-        "CALL 📈",
-        "PUT 📉"
-    ])
+        data = get_stock_data(symbol)
+        if data is not None and len(data) >= 2:
+            return "CALL 📈" if data["Close"].iloc[-1] > data["Close"].iloc[0] else "PUT 📉"
+    except: pass
+    return random.choice(["CALL 📈", "PUT 📉"])
 
 # ==================================================
 # OPTION FUNCTIONS
 # ==================================================
 
 def get_option_expiry(symbol):
-
     try:
-
-        stock = yf.Ticker(symbol)
-
-        expiries = stock.options
-
-        if len(expiries) == 0:
-            return None
-
-        weekly_expiry = None
-        daily_expiry = None
-        swing_expiry = None
-
-        today = datetime.now().date()
-
-        for expiry in expiries:
-
-            expiry_date = datetime.strptime(
-                expiry,
-                "%Y-%m-%d"
-            ).date()
-
-            days = (
-                expiry_date - today
-            ).days
-
-            # Weekly (المفضل)
-            if 5 <= days <= 10:
-
-                if weekly_expiry is None:
-                    weekly_expiry = expiry
-
-            # Daily
-            elif 0 <= days <= 3:
-
-                if daily_expiry is None:
-                    daily_expiry = expiry
-
-            # Swing
-            elif 14 <= days <= 30:
-
-                if swing_expiry is None:
-                    swing_expiry = expiry
-
-        if weekly_expiry:
-            return weekly_expiry
-
-        if daily_expiry:
-            return daily_expiry
-
-        if swing_expiry:
-            return swing_expiry
-
-        return expiries[0]
-
-    except Exception:
-
-        return None
-
+        chain = get_option_chain_data(symbol)
+        expiries = chain.get("expiries", []) if chain else []
+        return expiries[0] if expiries else None
+    except: return None
 
 # ==================================================
-# CONTRACT SELECTION ENGINE V1
+# CONTRACT SELECTION ENGINE
 # ==================================================
 
 def get_best_option(symbol, signal_type):
-
     try:
-
-        stock = yf.Ticker(symbol)
-
+        stock_data = get_stock_data(symbol)
+        chain = get_option_chain_data(symbol)
+        if stock_data is None or chain is None: return None
+        
         expiry = get_option_expiry(symbol)
+        if not expiry: return None
 
-        if not expiry:
-            return None
+        current_price = float(stock_data["Close"].iloc[-1])
+        options = pd.DataFrame(chain.get("calls" if "CALL" in signal_type else "puts", []))
 
-        current_price = float(
-            stock.history(
-                period="1d"
-            )["Close"].iloc[-1]
-        )
+        # 1. فلترة العقود الضعيفة
+        options = options[(options["openInterest"] > 0) & (options["volume"] > 0)]
+        if len(options) == 0: return None
 
-        chain = stock.option_chain(expiry)
-
+        # 2. فلتر الـ Strike
+        max_dist = 0.05 if symbol in ["SPY", "QQQ", "SPX"] else 0.10
         if "CALL" in signal_type:
-            options = chain.calls
+            options = options[(options["strike"] >= current_price) & (options["strike"] <= current_price * (1 + max_dist))]
         else:
-            options = chain.puts
+            options = options[(options["strike"] <= current_price) & (options["strike"] >= current_price * (1 - max_dist))]
+        
+        if len(options) == 0: return None
 
-        # إزالة العقود الضعيفة
-        options = options[
-            (options["openInterest"] > 0)
-            &
-            (options["volume"] > 0)
-        ]
+        # 3. فلتر السعر
+        options = options[(options["lastPrice"] >= 1) & (options["lastPrice"] <= 10)].copy()
+        if len(options) == 0: return None
 
-        if len(options) == 0:
-            return None
-
-        # ==================================================
-        # STRIKE FILTER
-        # ==================================================
-
-        index_symbols = [
-            "SPY",
-            "QQQ",
-            "SPX"
-        ]
-
-        if symbol in index_symbols:
-            max_distance_percent = 0.05
-        else:
-            max_distance_percent = 0.10
-
-        if "CALL" in signal_type:
-
-            options = options[
-                (options["strike"] >= current_price)
-                &
-                (
-                    options["strike"]
-                    <= current_price *
-                    (
-                        1 + max_distance_percent
-                    )
-                )
-            ]
-
-        else:
-
-            options = options[
-                (options["strike"] <= current_price)
-                &
-                (
-                    options["strike"]
-                    >= current_price *
-                    (
-                        1 - max_distance_percent
-                    )
-                )
-            ]
-
-        if len(options) == 0:
-            return None
-
-        # ==================================================
-        # CONTRACT PRICE FILTER
-        # ==================================================
-
-        options = options[
-            (options["lastPrice"] >= 1)
-            &
-            (options["lastPrice"] <= 10)
-        ]
-
-        if len(options) == 0:
-            return None
-
-        options = options.copy()
-
-        # ==================================================
-        # DISTANCE
-        # ==================================================
-
-        options["distance"] = (
-            options["strike"]
-            - current_price
-        ).abs()
-# ==================================================
-# CONTRACT SCORE
-# ==================================================
-
-        options["score"] = (
-            (1 / (options["distance"] + 1)) * 35
-            +
-            options["openInterest"] * 0.002
-            +
-            options["volume"] * 0.003
-        )
-
-        options = options.sort_values(
-            by="score",
-            ascending=False
-        )
-
+        # 4. حساب المسافة والسكور
+        options["distance"] = (options["strike"] - current_price).abs()
+        options["score"] = ((1 / (options["distance"] + 1)) * 35) + (options["openInterest"] * 0.002) + (options["volume"] * 0.003)
+        options = options.sort_values(by="score", ascending=False)
+        
         best = options.iloc[0]
 
-       # ==================================================
-        # CREATE TRADE
-        # ==================================================
-
+        # 5. الإرجاع النهائي
         return {
-
-            "contract_symbol": str(
-                best["contractSymbol"]
-            ),
-
-            "strike": float(
-                best["strike"]
-            ),
-
-            "option_price": round(
-                float(best["lastPrice"]),
-                2
-            ),
-
+            "contract_symbol": str(best["contractSymbol"]),
+            "strike": float(best["strike"]),
+            "option_price": round(float(best["lastPrice"]), 2),
             "expiry": expiry,
-
-            "open_interest": int(
-                best["openInterest"]
-            ),
-
-            "volume": int(
-                best["volume"]
-            ),
-
-            "distance": round(
-                float(best["distance"]),
-                2
-            )
-
+            "open_interest": int(best["openInterest"]),
+            "volume": int(best["volume"]),
+            "distance": round(float(best["distance"]), 2)
         }
-
     except Exception as e:
-
-        print(
-            "OPTION ERROR:",
-            e
-        )
-
+        print("OPTION ERROR:", e)
         return None
-        
-# ==================================================
+
+ # ==================================================
 # CONTRACT RATING ENGINE
 # ==================================================
 
@@ -317,15 +190,10 @@ def get_contract_rating(
     # ==================
 
     if 0.5 <= option_price <= 5:
-
         score += 35
-
     elif option_price <= 10:
-
         score += 25
-
     else:
-
         score += 10
 
     # ==================
@@ -333,15 +201,10 @@ def get_contract_rating(
     # ==================
 
     if open_interest >= 1000:
-
         score += 30
-
     elif open_interest >= 500:
-
         score += 20
-
     elif open_interest >= 100:
-
         score += 10
 
     # ==================
@@ -349,15 +212,10 @@ def get_contract_rating(
     # ==================
 
     if volume >= 300:
-
         score += 20
-
     elif volume >= 150:
-
         score += 15
-
     elif volume >= 50:
-
         score += 10
 
     # ==================
@@ -365,31 +223,29 @@ def get_contract_rating(
     # ==================
 
     if distance <= 3:
-
         score += 15
-
     elif distance <= 5:
-
         score += 10
-
     else:
-
         score += 5
+
+    # ==================
+    # FINAL SCORE
+    # ==================
+
+    score = min(score, 100)
 
     # ==================
     # RATING
     # ==================
 
     if score >= 90:
-
         return "A+"
 
     elif score >= 75:
-
         return "A"
 
     elif score >= 60:
-
         return "B"
 
     return "WEAK"
@@ -453,6 +309,7 @@ def final_approval(
 
     return "NO TRADE"
 
+
 # ==================================================
 # CREATE TRADE
 # ==================================================
@@ -463,9 +320,15 @@ def create_trade(symbol):
 
     score_data = get_signal_score(symbol)
 
-    confidence = score_data["confidence"]
+    confidence = score_data.get(
+        "confidence",
+        "NO TRADE"
+    )
 
-    score = score_data["score"]
+    score = score_data.get(
+        "score",
+        0
+    )
 
     if confidence == "NO TRADE":
 
@@ -476,7 +339,7 @@ def create_trade(symbol):
         signal_type
     )
 
-    if option_data is None:
+    if not option_data:
 
         return None
 
@@ -488,7 +351,8 @@ def create_trade(symbol):
 
     contract_symbol = option_data["contract_symbol"]
 
-   # ==================================================
+
+    # ==================================================
     # CONTRACT RATING
     # ==================================================
 
@@ -547,28 +411,28 @@ def create_trade(symbol):
         "expiry": expiry,
 
         "tp1": round(
-            entry * 1.3,
+            entry * 1.30,
             2
         ),
 
         "tp2": round(
-            entry * 1.6,
+            entry * 1.60,
             2
         ),
 
         "tp3": round(
-            entry * 2.0,
+            entry * 2.00,
             2
         ),
 
         "sl": round(
-            entry * 0.7,
+            entry * 0.70,
             2
         ),
 
         "status": "NEW",
 
-        "profit": 0,
+        "profit": 0.0,
 
         "stage": 0,
 
@@ -577,13 +441,15 @@ def create_trade(symbol):
         )
 
     }
+
+
 # ==================================================
 # SIGNAL SCORE ENGINE
 # ==================================================
-
 # ==================================================
 # MARKET REGIME ENGINE
 # ==================================================
+
 def get_market_regime():
 
     try:
@@ -601,33 +467,45 @@ def get_market_regime():
 
         for name, symbol in market_symbols.items():
 
-            stock = yf.Ticker(symbol)
+            data = get_stock_data(symbol)
 
-            data = stock.history(period="1y")
+            if data is None or len(data) < 200:
 
-            print(name, len(data))
-
-            if len(data) < 200:
                 continue
 
-            close = float(data["Close"].iloc[-1])
+            close = float(
 
-            ema50 = data["Close"].ewm(span=50).mean().iloc[-1]
+                data["Close"].iloc[-1]
 
-            ema200 = data["Close"].ewm(span=200).mean().iloc[-1]
+            )
+
+            ema50 = (
+
+                data["Close"]
+                .ewm(span=50)
+                .mean()
+                .iloc[-1]
+
+            )
+
+            ema200 = (
+
+                data["Close"]
+                .ewm(span=200)
+                .mean()
+                .iloc[-1]
+
+            )
 
             symbol_score = 0
 
             if close > ema50:
+
                 symbol_score += 50
 
             if close > ema200:
-                symbol_score += 50
 
-            print(
-                f"{name} SCORE =",
-                symbol_score
-            )
+                symbol_score += 50
 
             if name == "SPX":
 
@@ -646,19 +524,17 @@ def get_market_regime():
                 score += symbol_score * 0.10
 
         score = round(score)
-
-        # ==================
-        # MARKET SENTIMENT
-        # ==================
+        
+# ==================
+# MARKET SENTIMENT
+# ==================
 
         sentiment_score = 0
 
         # VIX
-        vix = yf.Ticker("^VIX")
+        vix_data = get_vix_data()
 
-        vix_data = vix.history(period="1mo")
-
-        if len(vix_data) > 0:
+        if vix_data is not None and len(vix_data) > 0:
 
             vix_close = float(
                 vix_data["Close"].iloc[-1]
@@ -672,16 +548,10 @@ def get_market_regime():
 
                 sentiment_score -= 3
 
-            print(
-                "VIX =", round(vix_close, 2)
-            )
-
         # GOLD
-        gold = yf.Ticker("GLD")
+        gold_data = get_gold_data()
 
-        gold_data = gold.history(period="1mo")
-
-        if len(gold_data) > 0:
+        if gold_data is not None and len(gold_data) > 0:
 
             gold_close = float(
                 gold_data["Close"].iloc[-1]
@@ -702,16 +572,10 @@ def get_market_regime():
 
                 sentiment_score += 2
 
-            print(
-                "GOLD =", round(gold_close, 2)
-            )
-
         # BITCOIN
-        btc = yf.Ticker("BTC-USD")
+        btc_data = get_crypto_data()
 
-        btc_data = btc.history(period="1mo")
-
-        if len(btc_data) > 0:
+        if btc_data is not None and len(btc_data) > 0:
 
             btc_close = float(
                 btc_data["Close"].iloc[-1]
@@ -732,15 +596,6 @@ def get_market_regime():
 
                 sentiment_score -= 2
 
-            print(
-                "BTC =", round(btc_close, 2)
-            )
-
-        print(
-            "SENTIMENT SCORE =",
-            sentiment_score
-        )
-
         score += sentiment_score
 
         score = round(score)
@@ -756,11 +611,6 @@ def get_market_regime():
         else:
 
             bias = "BEARISH 📉"
-
-        print(
-            "MARKET SCORE =",
-            score
-        )
 
         return {
 
@@ -784,8 +634,7 @@ def get_market_regime():
 
         }
 
-
-# ==================================================
+ # ==================================================
 # MARKET CACHE
 # ==================================================
 
@@ -807,7 +656,8 @@ def get_cached_market():
         market_cache_time = now
 
     return market_cache
-    
+
+
 # ==================================================
 # REAL SCORE ENGINE
 # ==================================================
@@ -831,53 +681,102 @@ def get_signal_score(symbol):
             market["market_score"] * 0.35
         )
 
-        print("AFTER MARKET =", score)
+        print(
+            "AFTER MARKET =",
+            score
+        )
 
-        stock = yf.Ticker(symbol)
+        # ==========================
+        # GET DATA FROM SOURCE ENGINE
+        # ==========================
 
-        data = stock.history(period="6mo")
+        data = get_stock_data(symbol)
 
-        print("LEN =", len(data))
+        if data is None:
+
+            return {
+
+                "score": 0,
+
+                "confidence": "NO TRADE"
+
+            }
+
+        print(
+            "LEN =",
+            len(data)
+        )
 
         if len(data) < 100:
 
-            print("NOT ENOUGH DATA")
+            print(
+                "NOT ENOUGH DATA"
+            )
 
             return {
+
                 "score": 0,
+
                 "confidence": "NO TRADE"
+
             }
 
-        close = float(data["Close"].iloc[-1])
+        close = float(
+            data["Close"].iloc[-1]
+        )
 
-        ema20 = data["Close"].ewm(span=20).mean().iloc[-1]
+        ema20 = (
+            data["Close"]
+            .ewm(span=20)
+            .mean()
+            .iloc[-1]
+        )
 
-        ema50 = data["Close"].ewm(span=50).mean().iloc[-1]
+        ema50 = (
+            data["Close"]
+            .ewm(span=50)
+            .mean()
+            .iloc[-1]
+        )
 
-        ema200 = data["Close"].ewm(span=200).mean().iloc[-1]
+        ema200 = (
+            data["Close"]
+            .ewm(span=200)
+            .mean()
+            .iloc[-1]
+        )
 
         structure_score = 0
 
         if close > ema20:
+
             structure_score += 30
 
         if close > ema50:
+
             structure_score += 35
 
         if close > ema200:
+
             structure_score += 35
 
-        print("STRUCTURE SCORE =", structure_score)
+        print(
+            "STRUCTURE SCORE =",
+            structure_score
+        )
 
         score += round(
             structure_score * 0.30
         )
 
-        print("AFTER STRUCTURE =", score)
+        print(
+            "AFTER STRUCTURE =",
+            score
+        )
 
-     # ==================
-        # MOMENTUM LAYER
-        # ==================
+       # ==================
+# MOMENTUM LAYER
+# ==================
 
         rsi_period = 14
 
@@ -889,7 +788,8 @@ def get_signal_score(symbol):
 
         avg_gain = gain.rolling(rsi_period).mean()
 
-        avg_loss = loss.rolling(rsi_period).mean()
+        avg_loss = gain.rolling(rsi_period).mean() * 0 + loss.rolling(rsi_period).mean()
+        avg_loss = avg_loss.replace(0, 0.000001)
 
         rs = avg_gain / avg_loss
 
@@ -954,7 +854,6 @@ def get_signal_score(symbol):
         print("AFTER VOLUME =", score)
 
 
-
         # =========================
         # SMART MONEY LAYER (BoS)
         # =========================
@@ -982,6 +881,7 @@ def get_signal_score(symbol):
         )
 
         print("AFTER BOS =", score)
+
 
        # ==================
         # BREAKOUT PATTERN
@@ -1342,10 +1242,9 @@ def get_signal_score(symbol):
         print("AFTER ORDER BLOCK =", score)
 
         
-
 # ==================
-        # PULLBACK LAYER
-        # ==================
+# PULLBACK LAYER
+# ==================
 
         pullback_score = 0
 
@@ -1362,7 +1261,7 @@ def get_signal_score(symbol):
 
             trend_alignment = True
 
-# ==================
+        # ==================
         # HEALTHY RSI
         # ==================
 
@@ -1426,6 +1325,9 @@ def get_signal_score(symbol):
 
             pullback_score += 25
 
+        # عدم تجاوز الحد الأقصى
+        pullback_score = min(pullback_score, 100)
+
         print("PULLBACK SCORE =", pullback_score)
 
         score += round(
@@ -1433,10 +1335,11 @@ def get_signal_score(symbol):
         )
 
         print("AFTER PULLBACK =", score)
-     
+
+
 # ==================
-        # BULL FLAG LAYER
-        # ==================
+# BULL FLAG LAYER
+# ==================
 
         bullflag_score = 0
 
@@ -1468,6 +1371,11 @@ def get_signal_score(symbol):
         if mtf_confirmation:
             bullflag_score += 10
 
+        bullflag_score = min(
+            bullflag_score,
+            100
+        )
+
         print("BULL FLAG SCORE =", bullflag_score)
 
         score += round(
@@ -1477,13 +1385,6 @@ def get_signal_score(symbol):
         print("AFTER BULL FLAG =", score)
 
         # ==================
-        # TREND BONUS
-        # ==================
-
-        if "CALL" in trend:
-
-            score += 10
-        # ==================
         # SCORE LIMIT
         # ==================
 
@@ -1491,6 +1392,7 @@ def get_signal_score(symbol):
             score,
             100
         )
+
         print("FINAL SCORE =", score)
 
         if score >= 90:
@@ -1510,8 +1412,11 @@ def get_signal_score(symbol):
             confidence = "NO TRADE"
 
         return {
+
             "score": score,
+
             "confidence": confidence
+
         }
 
     except Exception as e:
@@ -1519,12 +1424,16 @@ def get_signal_score(symbol):
         print(f"ERROR IN {symbol}: {e}")
 
         return {
+
             "score": 0,
+
             "confidence": "NO TRADE"
+
         }
 
-
-# ================= SIGNAL ENGINE =================
+# ==================================================
+# SIGNAL ENGINE
+# ==================================================
 
 import time
 
@@ -1581,8 +1490,15 @@ def show_top_signals():
     for signal in signals:
 
         signal_id = (
+
             signal["symbol"],
-            signal["signal_type"]
+
+            signal["signal_type"],
+
+            signal["contract_symbol"],
+
+            signal["expiry"]
+
         )
 
         if signal_id not in sent_signals:
@@ -1592,10 +1508,636 @@ def show_top_signals():
             sent_signals.add(signal_id)
 
             print(
+
                 f"{signal['symbol']} | "
+
                 f"Score: {signal['score']} | "
+
                 f"{signal['confidence']}"
+
             )
+
+        else:
+
+            print(
+
+                f"⏩ Skipping "
+
+                f"{signal['symbol']} "
+
+                f"(already sent)"
+
+            )
+
+# ==================================================
+# ADEL SMART BOT V2.1 - PRODUCTION READY (ELITE FINAL FREEZE)
+# ==================================================
+
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes
+)
+
+from datetime import (
+    datetime,
+    timedelta,
+    time
+)
+
+import random
+import time
+import threading
+import pandas as pd
+
+# ==================================================
+# CONFIG
+# ==================================================
+
+from config import (
+    WATCHLIST,
+    BOT_TOKEN,
+    CHAT_ID,
+    CHANNEL_URL,
+    ADMIN_ID,
+    MIN_OPTION_PRICE,
+    MAX_OPTION_PRICE,
+    CONFIDENCE_A_PLUS,
+    CONFIDENCE_A,
+    CONFIDENCE_B
+)
+
+# ==================================================
+# TRADE MANAGER
+# ==================================================
+
+from trade_manager import update_trade
+
+# ==================================================
+# SCHEDULER
+# ==================================================
+
+from daily_scheduler import DailyScheduler
+
+# ==================================================
+# TELEGRAM ENGINE
+# ==================================================
+
+from telegram_bot.telegram_engine import TelegramEngine
+from telegram_bot.telegram_app import TelegramApp
+
+# ==================================================
+# MARKET DATA ENGINES
+# ==================================================
+
+from market.data_engine import (
+    get_stock_data,
+    get_option_chain_data,
+    get_vix_data,
+    get_gold_data,
+    get_crypto_data
+)
+
+# ==================================================
+# NEWS ENGINE (NEW SYSTEM)
+# ==================================================
+
+from news.news_engine import NewsEngine
+
+
+# ==================================================
+# GLOBAL CACHE
+# ==================================================
+
+market_cache = None
+market_cache_time = None
+
+sent_signals = set()
+
+# ==================================================
+# MARKET FUNCTIONS
+# ==================================================
+
+def get_stock_price(symbol):
+    try:
+        data = get_stock_data(symbol)
+        if data is not None and not data.empty:
+            return round(float(data["Close"].iloc[-1]), 2)
+    except:
+        pass
+    return None
+
+
+def get_trend(symbol):
+    try:
+        data = get_stock_data(symbol)
+        if data is not None and len(data) >= 2:
+            return "CALL 📈" if data["Close"].iloc[-1] > data["Close"].iloc[0] else "PUT 📉"
+    except:
+        pass
+    return random.choice(["CALL 📈", "PUT 📉"])
+
+
+# ==================================================
+# OPTION FUNCTIONS
+# ==================================================
+
+def get_option_expiry(symbol):
+    try:
+        chain = get_option_chain_data(symbol)
+        expiries = chain.get("expiries", []) if chain else []
+        return expiries[0] if expiries else None
+    except:
+        return None
+
+
+# ==================================================
+# CONTRACT SELECTION ENGINE
+# ==================================================
+
+def get_best_option(symbol, signal_type):
+    try:
+        stock_data = get_stock_data(symbol)
+        chain = get_option_chain_data(symbol)
+        if stock_data is None or chain is None:
+            return None
+
+        expiry = get_option_expiry(symbol)
+        if not expiry:
+            return None
+
+        current_price = float(stock_data["Close"].iloc[-1])
+        options = pd.DataFrame(chain.get("calls" if "CALL" in signal_type else "puts", []))
+
+        options = options[(options["openInterest"] > 0) & (options["volume"] > 0)]
+        if len(options) == 0:
+            return None
+
+        max_dist = 0.05 if symbol in ["SPY", "QQQ", "SPX"] else 0.10
+        if "CALL" in signal_type:
+            options = options[(options["strike"] >= current_price) & (options["strike"] <= current_price * (1 + max_dist))]
+        else:
+            options = options[(options["strike"] <= current_price) & (options["strike"] >= current_price * (1 - max_dist))]
+
+        if len(options) == 0:
+            return None
+
+        options = options[(options["lastPrice"] >= MIN_OPTION_PRICE) & (options["lastPrice"] <= MAX_OPTION_PRICE)]
+        if len(options) == 0:
+            return None
+
+        options["distance"] = (options["strike"] - current_price).abs()
+        options["score"] = ((1 / (options["distance"] + 1)) * 35) + (options["openInterest"] * 0.002) + (options["volume"] * 0.003)
+        options = options.sort_values(by="score", ascending=False)
+
+        best = options.iloc[0]
+
+        return {
+            "contract_symbol": str(best["contractSymbol"]),
+            "strike": float(best["strike"]),
+            "option_price": round(float(best["lastPrice"]), 2),
+            "expiry": expiry,
+            "open_interest": int(best["openInterest"]),
+            "volume": int(best["volume"]),
+            "distance": round(float(best["distance"]), 2),
+            "bid": float(best.get("bid", best["lastPrice"])),
+            "ask": float(best.get("ask", best["lastPrice"])),
+            "delta": float(best.get("delta", 0.0))
+        }
+    except Exception as e:
+        print("OPTION ERROR:", e)
+        return None
+
+
+# ==================================================
+# CONTRACT RATING ENGINE
+# ==================================================
+
+def get_contract_rating(
+    option_price,
+    open_interest,
+    volume,
+    distance,
+    bid=None,
+    ask=None,
+    delta=None
+):
+
+    score = 0
+
+    if MIN_OPTION_PRICE <= option_price <= MAX_OPTION_PRICE:
+        score += 35
+    elif option_price <= MAX_OPTION_PRICE * 1.5:
+        score += 25
+    else:
+        score += 10
+
+    if open_interest >= 1000:
+        score += 30
+    elif open_interest >= 500:
+        score += 20
+    elif open_interest >= 100:
+        score += 10
+
+    if volume >= 300:
+        score += 20
+    elif volume >= 150:
+        score += 15
+    elif volume >= 50:
+        score += 10
+
+    if distance <= 3:
+        score += 15
+    elif distance <= 5:
+        score += 10
+    else:
+        score += 5
+
+    if bid is not None and ask is not None:
+        spread = ask - bid
+        if spread <= option_price * 0.05:
+            score += 10
+        elif spread <= option_price * 0.10:
+            score += 5
+
+    if delta is not None:
+        if 0.3 <= abs(delta) <= 0.7:
+            score += 10
+
+    score = min(score, 100)
+
+    if score >= 90:
+        return "A+"
+    elif score >= 75:
+        return "A"
+    elif score >= 60:
+        return "B"
+    return "WEAK"
+
+
+# ==================================================
+# FINAL APPROVAL ENGINE
+# ==================================================
+
+def final_approval(
+    stock_rating,
+    contract_rating
+):
+
+    if stock_rating == "A+" and contract_rating == "A+":
+        return "SEND"
+
+    if stock_rating in ["A+", "A"] and contract_rating in ["A+", "A"]:
+        return "SEND"
+
+    if stock_rating == "A" and contract_rating == "B":
+        return "ALLOW"
+
+    if contract_rating == "WEAK":
+        return "NO TRADE"
+
+    return "NO TRADE"
+
+
+# ==================================================
+# DATA QUALITY ENGINE
+# ==================================================
+
+def check_data_quality(symbol, data, option_data) -> bool:
+    if data is None or len(data) < 100:
+        print(f"❌ DATA QUALITY: insufficient data for {symbol}")
+        return False
+
+    if option_data is None:
+        print(f"❌ DATA QUALITY: no option data for {symbol}")
+        return False
+
+    if option_data["option_price"] <= 0:
+        print(f"❌ DATA QUALITY: invalid option price for {symbol}")
+        return False
+
+    return True
+
+
+# ==================================================
+# CONFIDENCE ENGINE
+# ==================================================
+
+def confidence_engine(layers, score, market_bias, market_score, trend):
+    ok_count = sum(1 for v in layers.values() if v)
+    missing_layers = [name for name, ok in layers.items() if not ok]
+
+    if market_bias == "BEARISH 📉" and "CALL" in trend:
+        print("❌ Confidence rejected — CALL vs Bearish Market")
+        print("Missing:", missing_layers)
+        return "NO TRADE"
+
+    if market_score < 50 and score >= 80:
+        print("❌ Confidence rejected — Weak Market")
+        print("Missing:", missing_layers)
+        return "NO TRADE"
+
+    if score >= CONFIDENCE_A_PLUS and ok_count >= 6:
+        return "A+"
+    if score >= CONFIDENCE_A and ok_count >= 5:
+        return "A"
+    if score >= CONFIDENCE_B and ok_count >= 4:
+        return "B+"
+
+    print("❌ Confidence rejected — Missing:", missing_layers)
+    return "NO TRADE"
+
+
+# ==================================================
+# REAL SCORE ENGINE
+# ==================================================
+
+def get_signal_score(symbol):
+
+    try:
+
+        score = 0
+        reasons = []
+
+        market = get_cached_market()
+
+        trend = get_trend(symbol)
+
+        score += round(
+            market["market_score"] * 0.35
+        )
+
+        data = get_stock_data(symbol)
+
+        if data is None or len(data) < 100:
+            return {
+                "score": 0,
+                "confidence": "NO TRADE",
+                "reasons": ["Not enough data"]
+            }
+
+        close = float(data["Close"].iloc[-1])
+
+        ema20 = data["Close"].ewm(span=20).mean().iloc[-1]
+        ema50 = data["Close"].ewm(span=50).mean().iloc[-1]
+        ema200 = data["Close"].ewm(span=200).mean().iloc[-1]
+
+        structure_score = 0
+
+        if close > ema20:
+            structure_score += 30
+            reasons.append("Price above EMA20")
+
+        if close > ema50:
+            structure_score += 35
+            reasons.append("Price above EMA50")
+
+        if close > ema200:
+            structure_score += 35
+            reasons.append("Price above EMA200")
+
+        score += round(structure_score * 0.30)
+
+        rsi_period = 14
+        delta = data["Close"].diff()
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        avg_gain = gain.rolling(rsi_period).mean()
+        avg_loss = loss.rolling(rsi_period).mean().replace(0, 0.000001)
+        rs = avg_gain / avg_loss
+        rsi_value = 100 - (100 / (1 + rs))
+
+        momentum_score = 0
+
+        if 50 <= rsi_value.iloc[-1] <= 70:
+            momentum_score += 60
+            reasons.append("RSI bullish zone")
+        elif 40 <= rsi_value.iloc[-1] < 50:
+            momentum_score += 30
+            reasons.append("RSI neutral")
+        elif rsi_value.iloc[-1] > 70:
+            momentum_score += 20
+            reasons.append("RSI overbought")
+
+        score += round(momentum_score * 0.10)
+
+        volume_avg = data["Volume"].rolling(20).mean().iloc[-1]
+        current_volume = data["Volume"].iloc[-1]
+
+        volume_score = 0
+
+        if current_volume > volume_avg * 1.5:
+            volume_score = 100
+            reasons.append("Volume spike")
+        elif current_volume > volume_avg:
+            volume_score = 60
+            reasons.append("Volume above average")
+
+        score += round(volume_score * 0.10)
+
+        last_close = data["Close"].iloc[-1]
+        recent_high = data["High"].iloc[-21:-1].max()
+        recent_low = data["Low"].iloc[-21:-1].min()
+
+        bos_score = 0
+
+        if last_close > recent_high:
+            bos_score = 100
+            reasons.append("Bullish BOS")
+        elif last_close < recent_low:
+            bos_score = 100
+            reasons.append("Bearish BOS")
+
+        score += round(bos_score * 0.20)
+
+        recent_high = data["High"].iloc[-11:-1].max()
+        breakout_score = 0
+
+        if last_close > recent_high:
+            breakout_score = 100
+            reasons.append("Breakout")
+
+        score += round(breakout_score * 0.05)
+
+        candle1_high = data["High"].iloc[-3]
+        candle1_low = data["Low"].iloc[-3]
+        candle3_high = data["High"].iloc[-1]
+        candle3_low = data["Low"].iloc[-1]
+
+        fvg_score = 0
+        bullish_fvg = candle3_low > candle1_high
+        bearish_fvg = candle3_high < candle1_low
+
+        if bullish_fvg:
+            fvg_score = 20
+            reasons.append("Bullish FVG")
+        elif bearish_fvg:
+            fvg_score = 20
+            reasons.append("Bearish FVG")
+
+        score += round(fvg_score * 0.10)
+
+        bullish_ob = (
+            data["Close"].iloc[-2] < data["Open"].iloc[-2]
+            and data["Close"].iloc[-1] > data["Open"].iloc[-1]
+            and close > ema20
+            and close > ema50
+        )
+
+        bearish_ob = (
+            data["Close"].iloc[-2] > data["Open"].iloc[-2]
+            and data["Close"].iloc[-1] < data["Open"].iloc[-1]
+            and close < ema20
+            and close < ema50
+        )
+
+        liquidity_sweep = False
+        last_5_high = data["High"].iloc[-6:-1].max()
+        last_5_low = data["Low"].iloc[-6:-1].min()
+
+        if data["High"].iloc[-1] > last_5_high and data["Close"].iloc[-1] < last_5_high:
+            liquidity_sweep = True
+            reasons.append("Liquidity sweep (highs)")
+        elif data["Low"].iloc[-1] < last_5_low and data["Close"].iloc[-1] > last_5_low:
+            liquidity_sweep = True
+            reasons.append("Liquidity sweep (lows)")
+
+        layers = {}
+        layers["market"] = market["market_score"] >= 60
+        layers["structure"] = structure_score >= 60
+        layers["momentum"] = momentum_score >= 30
+        layers["volume"] = volume_score >= 60
+        layers["smc"] = bos_score == 100 or bullish_ob or bearish_ob or liquidity_sweep
+        layers["pattern"] = breakout_score == 100 or fvg_score >= 20
+
+        score = min(score, 100)
+
+        confidence = confidence_engine(
+            layers,
+            score,
+            market["market_bias"],
+            market["market_score"],
+            trend
+        )
+
+        return {
+            "score": score,
+            "confidence": confidence,
+            "reasons": reasons
+        }
+
+    except Exception as e:
+
+        print(f"ERROR IN {symbol}: {e}")
+
+        return {
+            "score": 0,
+            "confidence": "NO TRADE",
+            "reasons": [f"Error: {e}"]
+        }
+
+
+# ==================================================
+# SIGNAL ENGINE
+# ==================================================
+
+sent_signals = set()
+
+
+def hard_filter(trade: dict, market: dict, session: str, news_engine: NewsEngine) -> bool:
+    try:
+        if news_engine.has_high_impact_event_window():
+            print("❌ HARD FILTER: high impact news window")
+            return False
+    except:
+        pass
+
+    if market["market_score"] < 50 and trade["confidence"] in ["A+", "A", "B+"]:
+        print("❌ HARD FILTER: weak market")
+        return False
+
+    if market["market_bias"] == "BEARISH 📉" and "CALL" in trade["signal_type"]:
+        print("❌ HARD FILTER: CALL vs Bearish")
+        return False
+
+    if trade.get("contract_rating") == "WEAK":
+        print("❌ HARD FILTER: weak contract")
+        return False
+
+    if session == "PRE_MARKET" and trade["symbol"] not in ["SPX", "SPY", "QQQ"]:
+        print("❌ HARD FILTER: non-index in pre-market")
+        return False
+
+    return True
+
+
+def scan_watchlist(session: str, news_engine: NewsEngine):
+
+    signals = []
+
+    all_symbols = (
+        WATCHLIST["INDICES"]
+        + WATCHLIST["ETFS"]
+        + WATCHLIST["STOCKS"]
+        + WATCHLIST["ENERGY"]
+        + WATCHLIST["GOLD"]
+        + WATCHLIST["BITCOIN"]
+    )
+
+    market = get_cached_market()
+
+    for symbol in all_symbols:
+
+        trade = create_trade(symbol)
+
+        if trade:
+
+            trade = update_trade(
+                trade,
+                trade["entry"]
+            )
+
+            if not hard_filter(trade, market, session, news_engine):
+                continue
+
+            signals.append(trade)
+
+    signals = sorted(
+        signals,
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    return signals[:5]
+
+
+def show_top_signals(session: str, news_engine: NewsEngine):
+
+    global sent_signals
+
+    telegram = TelegramEngine()
+
+    signals = scan_watchlist(session, news_engine)
+
+    for signal in signals:
+
+        signal_id = (
+            signal["symbol"],
+            signal["signal_type"],
+            signal["contract_symbol"],
+            signal["expiry"]
+        )
+
+        explain = "سبب الترشيح:\n" + "\n".join(
+            f"✔ {reason}" for reason in signal.get("reasons", [])
+        )
+
+        if signal_id not in sent_signals:
+
+            telegram.send_signal(signal, extra_text=explain)
+
+            sent_signals.add(signal_id)
 
         else:
 
@@ -1606,25 +2148,90 @@ def show_top_signals():
             )
 
 
+# ==================================================
+# MAIN
+# ==================================================
+
 if __name__ == "__main__":
 
     print("🚀 ADEL SMART BOT STARTED")
+
+    scheduler = DailyScheduler()
+    telegram = TelegramEngine()
+
+    news_engine = NewsEngine()
+
+    # ==================================================
+    # TELEGRAM USER INTERFACE
+    # ==================================================
+
+    telegram_ui = TelegramApp(
+        token=BOT_TOKEN,
+        channel_url=CHANNEL_URL,
+        admin_id=ADMIN_ID
+    )
+
+    ui_thread = threading.Thread(
+        target=lambda: telegram_ui.get_application().run_polling(
+            drop_pending_updates=True
+        ),
+        daemon=True
+    )
+
+    ui_thread.start()
+
+    # ==================================================
+    # MAIN LOOP
+    # ==================================================
 
     while True:
 
         try:
 
-            show_top_signals()
+            status = scheduler.run()
+
+            if status == "MARKET_OPEN":
+
+                print("📈 MARKET OPEN MODE")
+
+                show_top_signals("MARKET_OPEN", news_engine)
+
+                breaking_news = news_engine.breaking_news()
+                for news in breaking_news:
+                    telegram.send_message(news["message"])
+
+            elif status == "PRE_MARKET":
+
+                print("🌅 PRE MARKET MODE")
+
+                show_top_signals("PRE_MARKET", news_engine)
+
+                pre_market_news = news_engine.morning_news()
+                for news in pre_market_news:
+                    telegram.send_message(news["message"])
+
+            elif status == "AFTER_MARKET":
+
+                print("📊 AFTER MARKET MODE")
+
+                show_top_signals("AFTER_MARKET", news_engine)
+
+                after_market_news = news_engine.after_market_news()
+                for news in after_market_news:
+                    telegram.send_message(news["message"])
+
+            else:
+
+                print("🌙 MARKET CLOSED")
 
             print("⏳ Waiting 60 seconds...")
-
             time.sleep(60)
 
         except Exception as e:
 
             print("ERROR:", e)
-
             time.sleep(60)
 
             
+
             

@@ -1,378 +1,229 @@
-from telegram_sender import send_telegram_message
-import random
+# ==================================================
+# TELEGRAM ENGINE (EVENT-BASED)
+# ==================================================
+# مسؤول عن:
+#   - استقبال الأحداث من EventRouter
+#   - تفسير الحدث
+#   - توليد الصورة (إذا كان الحدث متعلقًا بالصفقة)
+#   - إرسال الرسالة النصية
+#   - إرسال الصورة (إن وجدت)
+#
+# لا يحتوي أي منطق تحليل أو تحديث أو حسابات.
+# لا يبني الرسائل بنفسه — الرسائل تأتي من TradeManager.
+#
+# تمت إضافة:
+#   - نظام مرونة (FEATURE_FLAGS) لجعل الصور والنصوص قابلة للتفعيل/الإيقاف
+#   - دعم مستقبلي لفلسفة:
+#       * شارت السهم
+#       * شارت العقد
+#       * صورة العقد + النص في رسالة واحدة
+#       * صورة التحديث + النص في رسالة واحدة
+#       * شارت السهم النهائي + النص
+#       * صورة الخبر + النص
+#       * صورة التقرير + النص
+# ==================================================
+
+import logging
+from core.events import TradeEvent, EventType
+from images.image_engine import ImageEngine
+from trade_manager import build_message
+from telegram_bot.telegram_api import TelegramAPI
+from config import BOT_TOKEN, CHAT_ID
 
 
 # ==================================================
-# WISDOM ENGINE
+# FEATURE FLAGS
 # ==================================================
 
-WISDOM_QUOTES = [
-
-    "💡 الانضباط يهزم الطمع.",
-
-    "💡 دع الأرباح تركض، واقطع الخسائر بسرعة.",
-
-    "💡 السوق يعطي فرصاً جديدة كل يوم.",
-
-    "💡 ليست كل صفقة رابحة، لكن الانضباط دائماً رابح.",
-
-    "💡 لا نرسل إشارة ثم ننساها، بل نرافق المتداول في رحلة الصفقة من البداية حتى النهاية.",
-
-    "💡 الخسارة الصغيرة تحمي من الخسارة الكبيرة.",
-
-    "💡 الصبر جزء من الربح.",
-
-    "💡 حماية رأس المال أهم من مطاردة الأرباح."
-
-]
-
-
-# ==================================================
-# TRADE STORY ENGINE
-# ==================================================
-
-TRADE_STORIES = [
-
-    "📖 رحلة الصفقة مستمرة.",
-
-    "📖 تم تحقيق مرحلة جديدة من الصفقة.",
-
-    "📖 الانضباط هو مفتاح الوصول للأهداف.",
-
-    "📖 بعض الصفقات تحتاج إلى الصبر حتى تظهر قوتها.",
-
-    "📖 إدارة الصفقة لا تقل أهمية عن الدخول."
-
-]
+FEATURE_FLAGS = {
+    "send_trade_image": True,
+    "send_trade_text": True,
+    "send_general_text": True,
+    "send_stock_chart_on_new_trade": True,
+    "send_option_chart_on_new_trade": True,
+    "send_contract_card_on_new_trade": True,
+    "send_contract_text_on_new_trade": True,
+    "send_final_stock_chart": True,
+    "send_news_image": True,
+    "send_report_image": True,
+}
 
 
 class TelegramEngine:
 
     def __init__(self):
-
-        self.channel_name = "ADEL SMART BOT"
-
-    # ==================================================
-    # WISDOM
-    # ==================================================
-
-    def get_random_wisdom(self):
-
-        return random.choice(
-            WISDOM_QUOTES
+        self.api = TelegramAPI(
+            token=BOT_TOKEN,
+            channel_id=CHAT_ID
         )
+        self.images = ImageEngine()
 
     # ==================================================
-    # TRADE STORY
+    # NEW — SEND SIGNAL (NO DUPLICATION)
     # ==================================================
 
-    def get_trade_story(self):
-
-        return random.choice(
-            TRADE_STORIES
+    def send_signal(self, trade: dict) -> None:
+        """
+        إرسال إشارة جديدة بصورة + نص باستخدام نفس منطق الأحداث.
+        """
+        event = TradeEvent.create(
+            EventType.NEW_TRADE,
+            trade
         )
-
-
-
-# ==================================================
-    # NEW SIGNAL
-    # ==================================================
-
-    def send_signal(self, signal):
-
-        message = f"""
-🚀 إشارة جديدة | ADEL SMART BOT
-
-🏢 الشركة: {signal['symbol']}
-
-📦 العقد:
-{signal['symbol']} {signal['strike']} {signal['signal_type']}
-
-⭐ التقييم:
-{signal['confidence']} ({signal['score']})
-
-💰 سعر الدخول:
-{signal['entry']}$
-
-📅 تاريخ الانتهاء:
-{signal['expiry']}
-
-━━━━━━━━━━━━━━
-
-🎯 الهدف الأول: {signal['tp1']}$
-🎯 الهدف الثاني: {signal['tp2']}$
-🏆 الهدف الثالث: {signal['tp3']}$
-🛑 وقف الخسارة: {signal['sl']}$
-
-━━━━━━━━━━━━━━
-
-🕒 وقت الإشارة:
-{signal['created_at']}
-
-💡 {self.get_random_wisdom()}
-"""
-
-        send_telegram_message(message)
-
-        print(message)
-
+        self._send_trade_event(event)
 
     # ==================================================
-    # UPDATE
+    # HANDLE EVENT
     # ==================================================
 
-    def send_update(self, trade):
+    def handle_event(self, event: TradeEvent) -> None:
+        event_type = event.type
 
-        message = f"""
-📊 تحديث الصفقة | ADEL SMART BOT
+        if event_type in (
+            EventType.NEW_TRADE,
+            EventType.TP1,
+            EventType.TP2,
+            EventType.TP3,
+            EventType.STOP_LOSS,
+            EventType.MOONSHOT,
+            EventType.LEGENDARY,
+            EventType.GOD_MODE,
+            EventType.PROGRESS_UPDATE,
+            EventType.OPEN_PROFIT,
+        ):
+            self._send_trade_event(event)
+            return
 
-🏢 الشركة: {trade['symbol']}
+        if event_type in (
+            EventType.RISK,
+            EventType.INDEX,
+            EventType.DISCLAIMER,
+        ):
+            self._send_general_message(event)
+            return
 
-💰 السعر الحالي: {trade['current_price']}$
-📈 الربح: {trade['profit']}%
-⏱ مدة الصفقة: {trade['duration']}
-
-🔄 آخر تحديث:
-{trade['last_update']}
-
-📖 {self.get_trade_story()}
-
-💡 {self.get_random_wisdom()}
-"""
-
-        send_telegram_message(message)
-
-        print(message)
-
-
-    # ==================================================
-    # TP1
-    # ==================================================
-
-    def send_tp1(self, trade):
-
-        message = f"""
-🎯 TP1 HIT
-
-📈 الربح: +{trade['profit']}%
-⏱ مدة الصفقة: {trade['duration']}
-
-🛡 تم نقل وقف الخسارة إلى نقطة الدخول.
-
-💡 {self.get_random_wisdom()}
-"""
-
-        send_telegram_message(message)
-
-        print(message)
-
+        logging.warning(f"حدث غير معروف في TelegramEngine: {event_type}")
 
     # ==================================================
-    # TP2
+    # SEND TRADE EVENT (IMAGE + TEXT)
     # ==================================================
 
-    def send_tp2(self, trade):
+    def _send_trade_event(self, event: TradeEvent) -> None:
+        trade = event.trade
+        event_type = event.type
 
-        message = f"""
-🎯 TP2 HIT
+        image_path = None
+        text = None
 
-📈 الربح: +{trade['profit']}%
-⏱ مدة الصفقة: {trade['duration']}
+        if FEATURE_FLAGS.get("send_trade_image", True):
+            try:
+                image_path = self.images.generate(event_type, trade)
+            except Exception as e:
+                logging.error(f"فشل توليد الصورة للحدث {event_type}: {e}")
+                image_path = None
 
-🛡 تم حماية أرباح الهدف الأول.
+        if FEATURE_FLAGS.get("send_trade_text", True):
+            try:
+                text = build_message(event)
+            except Exception as e:
+                logging.error(f"فشل بناء الرسالة للحدث {event_type}: {e}")
+                text = None
 
-💡 {self.get_random_wisdom()}
-"""
-
-        send_telegram_message(message)
-
-        print(message)
-
-
-    # ==================================================
-    # TARGET ACHIEVED
-    # ==================================================
-
-    def send_tp3(self, trade):
-
-        message = f"""
-🏆 TARGET ACHIEVED
-
-📈 الربح: +{trade['profit']}%
-⏱ مدة الصفقة: {trade['duration']}
-
-🛡 تم حماية أرباح الهدف الثاني.
-
-💡 {self.get_random_wisdom()}
-"""
-
-        send_telegram_message(message)
-
-        print(message)
-
+        if image_path and text:
+            self.api.send_photo_with_caption(image_path, text)
+        elif image_path and not text:
+            self.api.send_photo_with_caption(image_path, "")
+        elif text and not image_path:
+            self.api.send_message(text)
+        else:
+            logging.warning(f"لا صورة ولا نص للحدث {event_type}")
 
     # ==================================================
-    # STOP LOSS
+    # SEND GENERAL MESSAGE
     # ==================================================
 
-    def send_stop_loss(self, trade):
+    def _send_general_message(self, event: TradeEvent) -> None:
+        if not FEATURE_FLAGS.get("send_general_text", True):
+            return
 
-        message = f"""
-🛑 STOP LOSS
+        try:
+            text = build_message(event)
+        except Exception as e:
+            logging.error(f"فشل بناء الرسالة العامة: {e}")
+            return
 
-📉 الربح: {trade['profit']}%
-⏱ مدة الصفقة: {trade['duration']}
-
-💡 {self.get_random_wisdom()}
-"""
-
-        send_telegram_message(message)
-
-        print(message)
-
+        self.api.send_message(text)
 
     # ==================================================
-    # MOON SHOT
+    # FUTURE METHODS (UNCHANGED)
     # ==================================================
 
-    def send_moon_shot(self, trade):
+    def send_new_trade_bundle(
+        self,
+        stock_chart_path: str,
+        option_chart_path: str,
+        contract_image_path: str,
+        contract_text: str
+    ) -> None:
 
-        message = f"""
-🌙 MOON SHOT
+        if FEATURE_FLAGS.get("send_stock_chart_on_new_trade", True) and stock_chart_path:
+            self.api.send_photo_with_caption(stock_chart_path, "")
 
-💰 السعر الحالي: {trade['current_price']}$
-📈 الربح: +{trade['profit']}%
-⏱ مدة الصفقة: {trade['duration']}
+        if FEATURE_FLAGS.get("send_option_chart_on_new_trade", True) and option_chart_path:
+            self.api.send_photo_with_caption(option_chart_path, "")
 
-💡 {self.get_random_wisdom()}
-"""
+        if FEATURE_FLAGS.get("send_contract_card_on_new_trade", True) and contract_image_path:
+            caption = contract_text if FEATURE_FLAGS.get("send_contract_text_on_new_trade", True) else ""
+            self.api.send_photo_with_caption(contract_image_path, caption)
 
-        send_telegram_message(message)
+    def send_update_with_image_and_text(self, image_path: str, text: str) -> None:
+        if FEATURE_FLAGS.get("send_trade_image", True) and image_path:
+            caption = text if FEATURE_FLAGS.get("send_trade_text", True) else ""
+            self.api.send_photo_with_caption(image_path, caption)
+        elif FEATURE_FLAGS.get("send_trade_text", True) and text:
+            self.api.send_message(text)
 
-        print(message)
+    def send_final_stock_chart(self, final_chart_path: str, final_text: str) -> None:
+        if FEATURE_FLAGS.get("send_final_stock_chart", True) and final_chart_path:
+            self.api.send_photo_with_caption(final_chart_path, final_text)
+        else:
+            if final_text:
+                self.api.send_message(final_text)
 
+    def send_news_with_image(self, news_image_path: str, news_text: str) -> None:
+        if FEATURE_FLAGS.get("send_news_image", True) and news_image_path:
+            self.api.send_photo_with_caption(news_image_path, news_text)
+        else:
+            if news_text:
+                self.api.send_message(news_text)
+
+    def send_report_with_image(self, report_image_path: str, report_text: str) -> None:
+        if FEATURE_FLAGS.get("send_report_image", True) and report_image_path:
+            self.api.send_photo_with_caption(report_image_path, report_text)
+        else:
+            if report_text:
+                self.api.send_message(report_text)
+
+    def send_performance_report(self, report_image_path: str, report_text: str) -> None:
+        """
+        واجهة واضحة لتقارير الأداء:
+        يستقبل صورة جاهزة + نص جاهز من PerformanceEngine/ImageEngine،
+        ويرسلها بنفس منطق التقارير.
+        """
+        self.send_report_with_image(report_image_path, report_text)
 
     # ==================================================
-    # LEGENDARY TRADE
+    # PUBLIC SEND MESSAGE
     # ==================================================
 
-    def send_legendary_trade(self, trade):
+    def send_message(self, text: str) -> bool:
+        if not text:
+            logging.warning("محاولة إرسال رسالة فارغة.")
+            return False
 
-        message = f"""
-👑 LEGENDARY TRADE
-
-💰 السعر الحالي: {trade['current_price']}$
-📈 الربح: +{trade['profit']}%
-⏱ مدة الصفقة: {trade['duration']}
-
-📖 {self.get_trade_story()}
-
-💡 {self.get_random_wisdom()}
-"""
-
-        send_telegram_message(message)
-
-        print(message)
-
-        # ==================================================
-# TP1 MESSAGES
-# ==================================================
-
-TP1_MESSAGES = [
-
-    "🛡 تم نقل وقف الخسارة إلى نقطة الدخول.",
-
-    "📈 بداية ممتازة للصفقة.",
-
-    "🎯 الانضباط أهم من الطمع.",
-
-    "💰 حماية رأس المال أولاً."
-
-]
-
-
-# ==================================================
-# TP2 MESSAGES
-# ==================================================
-
-TP2_MESSAGES = [
-
-    "🛡 تم تأمين أرباح الهدف الأول.",
-
-    "📖 الصفقة تواصل رحلتها.",
-
-    "🚀 دع الأرباح تركض.",
-
-    "📈 بعض الصفقات تحتاج إلى الصبر."
-
-]
-
-
-# ==================================================
-# TP3 MESSAGES
-# ==================================================
-
-TP3_MESSAGES = [
-
-    "🏆 تم تحقيق الهدف الثالث.",
-
-    "🌙 الباب مفتوح لمرحلة MOON SHOT.",
-
-    "📈 بعض الصفقات لا تتوقف عند TP3.",
-
-    "🚀 الرحلة لم تنته بعد."
-
-]
-
-
-# ==================================================
-# STOP LOSS MESSAGES
-# ==================================================
-
-STOP_LOSS_MESSAGES = [
-
-    "💡 الخسارة الصغيرة تحمي من الخسارة الكبيرة.",
-
-    "💡 السوق يعطي فرصاً جديدة كل يوم.",
-
-    "💡 ليست كل صفقة رابحة، لكن الانضباط دائماً رابح.",
-
-    "💡 إدارة المخاطر أهم من مطاردة الأرباح."
-
-]
-
-
-# ==================================================
-# MOON SHOT MESSAGES
-# ==================================================
-
-MOON_SHOT_MESSAGES = [
-
-    "🌙 الصفقة دخلت مرحلة استثنائية.",
-
-    "🚀 دع الأرباح تركض.",
-
-    "📖 بعض الصفقات تكافئ الصبر.",
-
-    "🏆 رحلة مميزة حتى الآن."
-
-]
-
-
-# ==================================================
-# LEGENDARY TRADE MESSAGES
-# ==================================================
-
-LEGENDARY_MESSAGES = [
-
-    "👑 من إشارة عادية إلى صفقة أسطورية.",
-
-    "🏆 الصفقات العظيمة لا تأتي كل يوم.",
-
-    "🚀 الصبر والانضباط يصنعان المعجزات.",
-
-    "📖 رحلة استثنائية تستحق التذكر."
-
-]
-
-
+        try:
+            self.api.send_message(text)
+            return True
+        except Exception as e:
+            logging.error(f"فشل إرسال رسالة عامة: {e}")
+            return False

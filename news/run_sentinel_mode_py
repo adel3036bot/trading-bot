@@ -1,0 +1,48 @@
+import time
+import logging
+import config
+from news_engine import NewsEngine
+from telegram_engine import send_alert_to_telegram
+
+# تهيئة المحرك
+engine = NewsEngine()
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def run_sentinel_mode():
+    # مستقبلاً: نقوم بتحميل last_news_id من ملف json أو قاعدة بيانات صغيرة
+    last_news_id = None 
+    logging.info("🚀 Sentinel Mode Activated: الحارس في وضع الاستعداد...")
+
+    while True:
+        try:
+            # 1. استبدال get_top_news بدالة تجلب الخبر الحقيقي (مثلاً: fetch_latest_news)
+            # سنفترض وجود دالة تعيد قاموساً (Dictionary) يحتوي على "id" و "title"
+            news = engine.fetch_latest_news() 
+
+            if news:
+                news_id = news.get("id")
+                news_title = news.get("title", "")
+                news_priority = engine.get_news_priority(news_title)
+
+                # 2. الاستفادة من is_market_danger_event + get_news_priority
+                if news_id != last_news_id:
+                    if engine.is_market_danger_event(news_title) or news_priority == "HIGH":
+                        
+                        alert_message = f"🚨 **تنبيه عاجل (Sentinel):**\n{news_title}\nالأولوية: {news_priority}"
+                        send_alert_to_telegram(alert_message)
+                        
+                        last_news_id = news_id
+                        logging.info(f"⚠️ تم رصد خبر عاجل: {news_title}")
+
+            # 3. الفاصل الزمني من config
+            time.sleep(config.SENTINEL_CHECK_INTERVAL)
+
+        except Exception as e:
+            logging.error(f"❌ خطأ في الحارس: {e}")
+            time.sleep(300)
+
+if __name__ == "__main__":
+    run_sentinel_mode()
+
+    

@@ -17,7 +17,9 @@ def send_telegram_message(message):
 
         "text": message,
 
-        "parse_mode": "HTML"
+        "parse_mode": "HTML",
+
+        "disable_web_page_preview": True
 
     }
 
@@ -46,7 +48,6 @@ def send_telegram_message(message):
 
         print("❌ TELEGRAM ERROR")
         print(e)
-
 
 # ==================================================
 # SEND PHOTO
@@ -151,5 +152,15 @@ def send_telegram_document(file_path):
         print("❌ DOCUMENT ERROR")
         print(e)
 
+
+# ==================
+# TEST
+# ==================
+
+if __name__ == "__main__":
+
+    send_telegram_message(
+        "🚀 TELEGRAM TEST"
+    )
 
         
