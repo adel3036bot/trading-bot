@@ -39,7 +39,7 @@ class TelegramAPI:
     # ======================================================
     # SEND TEXT MESSAGE (SAFE & SYNC-FRIENDLY)
     # ======================================================
-    def send_message(self, text: str) -> bool:
+    def send_message(self, text: str, *, destination=None) -> bool:
         """
         إرسال رسالة نصية للقناة.
         يعمل مع python-telegram-bot 22.7 بدون مشاكل.
@@ -52,7 +52,7 @@ class TelegramAPI:
         try:
             future = asyncio.run_coroutine_threadsafe(
                 self.bot.send_message(
-                    chat_id=self.channel_id,
+                    chat_id=destination if destination is not None else self.channel_id,
                     text=text,
                     disable_web_page_preview=True
                 ),
@@ -69,7 +69,7 @@ class TelegramAPI:
     # ======================================================
     # SEND PHOTO WITH CAPTION (SAFE & SYNC-FRIENDLY)
     # ======================================================
-    def send_photo_with_caption(self, image_path: str, caption: str) -> bool:
+    def send_photo_with_caption(self, image_path: str, caption: str, *, destination=None) -> bool:
         """
         إرسال صورة + نص للقناة.
         يعمل مع python-telegram-bot 22.7 بدون مشاكل.
@@ -79,7 +79,7 @@ class TelegramAPI:
             with open(image_path, "rb") as photo:
                 future = asyncio.run_coroutine_threadsafe(
                     self.bot.send_photo(
-                        chat_id=self.channel_id,
+                        chat_id=destination if destination is not None else self.channel_id,
                         photo=photo,
                         caption=caption
                     ),

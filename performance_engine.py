@@ -3,14 +3,16 @@
 # ADEL SMART BOT ELITE
 # ==============================================================================
 
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import Counter
 import random
+from zoneinfo import ZoneInfo
 
 
 class PerformanceEngine:
 
-    def __init__(self):
+    def __init__(self, journal=None):
+        self.journal = journal
         self.reset()
 
     # ==================================================
@@ -87,6 +89,8 @@ class PerformanceEngine:
     # ==================================================
 
     def get_daily_report(self):
+        if self.journal is not None:
+            return self.get_journal_report()
         return {
             "report": "DAILY",
             "date": datetime.now().strftime("%Y-%m-%d"),
@@ -102,6 +106,21 @@ class PerformanceEngine:
             "worst_trade": self.worst_trade(),
             "best_symbol": self.best_symbol()
         }
+
+    def get_journal_report(self, start=None, end=None):
+        """Use recorded lifecycle facts only; never infer profit or win rate."""
+        end = end or datetime.now(ZoneInfo("Asia/Riyadh"))
+        start = start or end.replace(hour=0, minute=0, second=0, microsecond=0)
+        conn = self.journal.connect()
+        try:
+            signals = dict(conn.execute("SELECT asset_class, COUNT(*) FROM signal_journal WHERE created_at >= ? AND created_at < ? GROUP BY asset_class", (start.isoformat(), end.isoformat())).fetchall())
+            events = dict(conn.execute("SELECT event_type, COUNT(*) FROM signal_events WHERE event_timestamp >= ? AND event_timestamp < ? GROUP BY event_type", (start.isoformat(), end.isoformat())).fetchall())
+        finally:
+            conn.close()
+        return {"report": "DAILY", "date": start.date().isoformat(), "total_trades": sum(signals.values()), "by_asset": signals,
+                "tp1": events.get("TP1", 0), "tp2": events.get("TP2", 0), "tp3": events.get("TP3", 0), "stop_loss": events.get("STOP_LOSS", 0),
+                "completed": events.get("TRADE_CLOSED", 0), "win_rate": None, "average_profit": None, "total_profit": None,
+                "moon_shots": events.get("MOONSHOT", 0), "legendary_trades": events.get("LEGENDARY", 0), "best_symbol": None}
 
     # ==================================================
     # MESSAGE LIBRARY (PROFESSIONAL)
@@ -224,7 +243,7 @@ class PerformanceEngine:
 
         performance = self.get_daily_report()
 
-        conclusion = self.generate_conclusion(performance)
+        conclusion = self.generate_conclusion(performance) if performance.get("win_rate") is not None else "ℹ️ يعرض التقرير أحداثًا مثبتة فقط؛ لا تتوفر بيانات كافية لحساب الربح أو نسبة الفوز."
 
         after_items = []
 
@@ -238,9 +257,9 @@ class PerformanceEngine:
             "total_trades": performance["total_trades"],
             "winning_trades": performance["winning_trades"],
             "losing_trades": performance["losing_trades"],
-            "win_rate": performance["win_rate"],
-            "average_profit": performance["average_profit"],
-            "total_profit": performance["total_profit"],
+            "win_rate": performance["win_rate"] if performance["win_rate"] is not None else "—",
+            "average_profit": performance["average_profit"] if performance["average_profit"] is not None else "—",
+            "total_profit": performance["total_profit"] if performance["total_profit"] is not None else "—",
             "moon_shots": performance["moon_shots"],
             "legendary_trades": performance["legendary_trades"],
             "best_symbol": performance["best_symbol"],
@@ -249,8 +268,8 @@ class PerformanceEngine:
         text_message = (
             f"🌙 تقرير نهاية اليوم\n\n"
             f"📊 إجمالي الصفقات: {performance['total_trades']}\n"
-            f"🏆 نسبة الفوز: {performance['win_rate']}%\n"
-            f"💰 إجمالي الربح: {performance['total_profit']}\n"
+            f"🏆 نسبة الفوز: {performance['win_rate'] if performance['win_rate'] is not None else 'غير متاح'}\n"
+            f"💰 إجمالي الربح: {performance['total_profit'] if performance['total_profit'] is not None else 'غير متاح'}\n"
             f"🚀 صفقات Moonshot: {performance['moon_shots']}\n"
             f"👑 صفقات Legendary: {performance['legendary_trades']}\n"
             f"⭐ أفضل رمز تداول اليوم: {performance['best_symbol']}\n\n"

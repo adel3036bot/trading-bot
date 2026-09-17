@@ -4,6 +4,7 @@
 # ============================================================
 
 from datetime import datetime, time
+from zoneinfo import ZoneInfo
 import contextlib
 import concurrent.futures
 import io
@@ -20,107 +21,23 @@ except Exception:
 
 
 # ============================================================
-# COMPATIBILITY ADAPTERS
-# AdelSmartBot.py currently expects:
-#   morning_news()
-#   breaking_news()
-#   after_market_news()
-#
-# Current NewsEngine primarily exposes structured versions.
-# We bridge them here without modifying other files.
-# ============================================================
-
-def _legacy_morning_news(self):
-    try:
-        structured = self.morning_news_structured()
-
-        result = []
-
-        for item in structured or []:
-            if not isinstance(item, dict):
-                continue
-
-            result.append({
-                "message": item.get("text", ""),
-                "raw": item.get("raw")
-            })
-
-        return result
-
-    except Exception as e:
-        print(f"⚠️ LEGACY MORNING NEWS ADAPTER ERROR: {e}")
-        return []
-
-
-def _legacy_breaking_news(self):
-    try:
-        structured = self.breaking_news_structured()
-
-        result = []
-
-        for item in structured or []:
-            if not isinstance(item, dict):
-                continue
-
-            result.append({
-                "message": item.get("text", ""),
-                "raw": item.get("raw")
-            })
-
-        return result
-
-    except Exception as e:
-        print(f"⚠️ LEGACY BREAKING NEWS ADAPTER ERROR: {e}")
-        return []
-
-
-def _legacy_after_market_news(self):
-    try:
-        structured = self.after_market_structured()
-
-        result = []
-
-        for item in structured or []:
-            if not isinstance(item, dict):
-                continue
-
-            result.append({
-                "message": item.get("text", ""),
-                "raw": item.get("raw")
-            })
-
-        return result
-
-    except Exception as e:
-        print(f"⚠️ LEGACY AFTER-MARKET NEWS ADAPTER ERROR: {e}")
-        return []
-
-
-# Inject compatibility methods only when they do not already exist.
-if not hasattr(NewsEngine, "morning_news"):
-    NewsEngine.morning_news = _legacy_morning_news
-
-if not hasattr(NewsEngine, "breaking_news"):
-    NewsEngine.breaking_news = _legacy_breaking_news
-
-if not hasattr(NewsEngine, "after_market_news"):
-    NewsEngine.after_market_news = _legacy_after_market_news
-
-
-# ============================================================
 # DAILY SCHEDULER
 # ============================================================
 
 class DailyScheduler:
 
-    def __init__(self):
+    def __init__(self, telegram=None, news_engine=None):
 
         # ----------------------------------------------------
         # CORE ENGINES
         # ----------------------------------------------------
-        self.telegram = TelegramEngine()
-        self.news_engine = NewsEngine()
-        self.performance = PerformanceEngine()
+        # Inject shared process engines when available.  Keeping the defaults
+        # preserves direct Scheduler use in existing tests and scripts.
+        self.telegram = telegram or TelegramEngine()
+        self.news_engine = news_engine or NewsEngine()
+        self.performance = PerformanceEngine(journal=getattr(self.news_engine, "journal", None))
+        self.market_timezone = ZoneInfo("America/New_York")
+        self.display_timezone = ZoneInfo("Asia/Riyadh")
 
         # ----------------------------------------------------
         # IMAGE ENGINE
@@ -256,14 +173,14 @@ class DailyScheduler:
     # SAFE TEXT SENDER
     # ========================================================
 
-    def send_text_safe(self, text):
+    def send_text_safe(self, text, *, destination=None):
 
         if not text:
             print("⚠️ EMPTY TEXT")
             return False
 
         try:
-            return bool(self.telegram.send_message(text))
+            return bool(self.telegram.send_message(text, destination=destination))
         except Exception as e:
             print(f"❌ TELEGRAM TEXT SEND ERROR: {e}")
             return False
@@ -286,6 +203,25 @@ class DailyScheduler:
         template = data.get("template")
         image_data = data.get("image_data")
         text = data.get("text", "")
+        raw_news = data.get("raw") if message_type == "news" else None
+        destination = None
+        if message_type == "news" and hasattr(self.telegram, "news_destination"):
+            try:
+                destination = self.telegram.news_destination()
+            except Exception as error:
+                print(f"⚠️ NEWS ROUTE LOOKUP FAILED: {error}")
+
+        def finish(result, failure_reason=None):
+            success = bool(result)
+            if raw_news:
+                try:
+                    if success:
+                        self.news_engine.mark_as_sent(raw_news, destination=destination or "DEFAULT")
+                    else:
+                        self.news_engine.record_delivery_failure(raw_news, destination=destination or "DEFAULT", reason=failure_reason or "news_delivery_failed")
+                except Exception as error:
+                    print(f"⚠️ NEWS DELIVERY JOURNAL ERROR: {error}")
+            return success
 
         if not text:
             print("⚠️ STRUCTURED MESSAGE HAS NO TEXT")
@@ -295,21 +231,21 @@ class DailyScheduler:
         # ----------------------------------------------------
         if not template:
             print("⚠️ MISSING TEMPLATE → TEXT ONLY")
-            return self.send_text_safe(text)
+            return finish(self.send_text_safe(text, destination=destination), "missing_template")
 
         # ----------------------------------------------------
         # No image data
         # ----------------------------------------------------
         if image_data is None:
             print("⚠️ MISSING IMAGE DATA → TEXT ONLY")
-            return self.send_text_safe(text)
+            return finish(self.send_text_safe(text, destination=destination), "missing_image_data")
 
         # ----------------------------------------------------
         # Image engine unavailable
         # ----------------------------------------------------
         if self.image_engine is None:
             print("⚠️ IMAGE ENGINE UNAVAILABLE → TEXT ONLY")
-            return self.send_text_safe(text)
+            return finish(self.send_text_safe(text, destination=destination), "image_engine_unavailable")
 
         # ----------------------------------------------------
         # Generate image
@@ -322,11 +258,11 @@ class DailyScheduler:
 
             if not image_path:
                 print("⚠️ IMAGE NOT GENERATED → TEXT ONLY")
-                return self.send_text_safe(text)
+                return finish(self.send_text_safe(text, destination=destination), "image_not_generated")
 
         except Exception as e:
             print(f"⚠️ IMAGE GENERATION FAILED: {e}")
-            return self.send_text_safe(text)
+            return finish(self.send_text_safe(text, destination=destination), "image_generation_failed")
 
         # ----------------------------------------------------
         # Send image through current TelegramEngine API
@@ -339,11 +275,8 @@ class DailyScheduler:
                     self.telegram,
                     "send_news_with_image"
                 ):
-                    result = self.telegram.send_news_with_image(
-                        image_path,
-                        text
-                    )
-                    return True if result is None else bool(result)
+                    result = self.telegram.send_news_with_image(image_path, text, destination=destination)
+                    return finish(True if result is None else bool(result), "news_image_delivery_failed")
 
             else:
 
@@ -365,7 +298,7 @@ class DailyScheduler:
                 "→ TEXT ONLY"
             )
 
-            return self.send_text_safe(text)
+            return finish(self.send_text_safe(text, destination=destination), "news_send_method_unavailable")
 
         except Exception as e:
 
@@ -373,15 +306,14 @@ class DailyScheduler:
                 f"⚠️ IMAGE SEND FAILED: {e}"
             )
 
-            return self.send_text_safe(text)
+            return finish(self.send_text_safe(text, destination=destination), "image_send_failed")
 
     # ========================================================
     # MARKET HOURS — SAUDI TIME
     # ========================================================
 
     def is_morning_report_time(self):
-
-        now = datetime.now().time()
+        now = datetime.now(self.display_timezone).time()
 
         return (
             time(10, 0)
@@ -394,7 +326,7 @@ class DailyScheduler:
 
     def is_full_pre_market(self):
 
-        now = datetime.now().time()
+        now = datetime.now(self.display_timezone).time()
 
         return (
             time(14, 30)
@@ -407,7 +339,7 @@ class DailyScheduler:
 
     def is_pre_market(self):
 
-        now = datetime.now().time()
+        now = datetime.now(self.display_timezone).time()
 
         return (
             time(15, 30)
@@ -420,7 +352,7 @@ class DailyScheduler:
 
     def is_market_open(self):
 
-        now = datetime.now().time()
+        now = datetime.now(self.display_timezone).time()
 
         return (
             time(16, 30)
@@ -433,7 +365,7 @@ class DailyScheduler:
 
     def is_after_market(self):
 
-        now = datetime.now().time()
+        now = datetime.now(self.display_timezone).time()
 
         return (
             now >= time(23, 0)
@@ -445,7 +377,7 @@ class DailyScheduler:
 
     def is_sleep_time(self):
 
-        now = datetime.now().time()
+        now = datetime.now(self.display_timezone).time()
 
         return (
             (
@@ -469,7 +401,7 @@ class DailyScheduler:
 
     def reset_daily_flags(self):
 
-        now = datetime.now()
+        now = datetime.now(self.display_timezone)
 
         # 00:00–00:30 belongs to previous operational day.
         if now.time() >= time(0, 30):
@@ -876,12 +808,14 @@ class DailyScheduler:
             "date": datetime.now().strftime(
                 "%Y-%m-%d"
             ),
-            "total_trades": 0,
-            "win_rate": 0,
-            "best_trade": "",
-            "worst_trade": "",
-            "total_profit": 0,
-            "total_loss": 0,
+            # Pre-market has no completed-session performance yet.  Omit
+            # unavailable values rather than rendering zero as a real result.
+            "total_trades": None,
+            "win_rate": None,
+            "best_trade": None,
+            "worst_trade": None,
+            "total_profit": None,
+            "total_loss": None,
             "summary": (
                 "تقرير ما قبل الافتتاح "
                 "قبل بدء جلسة التداول."
@@ -1930,18 +1864,7 @@ class DailyScheduler:
                         message_type="news"
                     )
 
-                    if success:
-
-                        try:
-
-                            self.news_engine.mark_as_sent(
-                                item.get("raw")
-                            )
-
-                        except Exception:
-                            pass
-
-                    else:
+                    if not success:
 
                         news_success = False
 

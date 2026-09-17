@@ -227,7 +227,9 @@ class DataEngine:
         self,
         symbol: str,
         timeframe: str = "1D",
-        candles: int = 200
+        candles: int = 200,
+        *,
+        require_realtime: bool = True
 
     ):
 
@@ -237,7 +239,9 @@ class DataEngine:
 
             timeframe=timeframe,
 
-            candles=candles
+            candles=candles,
+
+            require_realtime=require_realtime
 
         )
         
@@ -423,7 +427,9 @@ def get_option_chain_data(
 
     symbol,
     timeframe="1D",
-    candles=200
+    candles=200,
+    *,
+    require_realtime=True
 
 ):
 
@@ -433,7 +439,9 @@ def get_option_chain_data(
 
         timeframe,
 
-        candles
+        candles,
+
+        require_realtime=require_realtime
 
     )
     
@@ -459,4 +467,3 @@ if __name__ == "__main__":
 
     print("\nData Engine Ready.")
 
-    

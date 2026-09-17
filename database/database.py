@@ -3,9 +3,14 @@
 # Database Manager — Phase 1 (Final 10/10)
 # ==========================================================
 
+import json
 import sqlite3
-from datetime import datetime
+import hashlib
+from collections.abc import Mapping
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+
+from core.signal_schema import AssetClass, Direction, InstrumentType, Signal, build_signal_id
 
 
 class DatabaseManager:
@@ -132,8 +137,522 @@ class DatabaseManager:
             )
         """)
 
+        # ----------------------------------------------------------
+        # SIGNAL JOURNAL — additive only; existing subscriber tables
+        # are intentionally never altered or rebuilt.
+        # ----------------------------------------------------------
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS signal_journal (
+                signal_id TEXT PRIMARY KEY,
+                asset_class TEXT NOT NULL,
+                instrument_type TEXT,
+                symbol TEXT NOT NULL,
+                contract_symbol TEXT,
+                direction TEXT,
+                strategy TEXT,
+                entry REAL,
+                stop_loss REAL,
+                targets_json TEXT,
+                entry_timeframe TEXT,
+                source_timestamp TEXT,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                data_quality TEXT,
+                rejection_reason TEXT,
+                metadata_json TEXT
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trade_journal (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                opened_at TEXT NOT NULL,
+                last_event_at TEXT,
+                state_json TEXT,
+                last_price_timestamp TEXT,
+                closed_at TEXT,
+                metadata_json TEXT,
+                FOREIGN KEY(signal_id) REFERENCES signal_journal(signal_id)
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS signal_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id TEXT NOT NULL,
+                trade_id INTEGER,
+                event_type TEXT NOT NULL,
+                event_key TEXT,
+                event_timestamp TEXT NOT NULL,
+                status TEXT NOT NULL,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(signal_id) REFERENCES signal_journal(signal_id),
+                FOREIGN KEY(trade_id) REFERENCES trade_journal(id)
+            )
+        """)
+
+        # Upgrade existing Phase 5 databases without rebuilding any table.
+        self._ensure_columns(cur, "trade_journal", {
+            "state_json": "TEXT",
+            "last_price_timestamp": "TEXT",
+            "closed_at": "TEXT",
+        })
+        self._ensure_columns(cur, "signal_events", {"event_key": "TEXT"})
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS signal_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id TEXT NOT NULL,
+                event_id INTEGER,
+                destination TEXT NOT NULL,
+                delivery_kind TEXT NOT NULL,
+                attempted_at TEXT NOT NULL,
+                success INTEGER NOT NULL,
+                failure_reason TEXT,
+                metadata_json TEXT,
+                FOREIGN KEY(signal_id) REFERENCES signal_journal(signal_id),
+                FOREIGN KEY(event_id) REFERENCES signal_events(id)
+            )
+        """)
+
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_journal_identity ON signal_journal(asset_class, symbol, contract_symbol);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_journal_signal_id ON trade_journal(signal_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_events_signal_id ON signal_events(signal_id, event_timestamp);")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_events_dedup ON signal_events(signal_id, event_key) WHERE event_key IS NOT NULL;")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_deliveries_signal_id ON signal_deliveries(signal_id, attempted_at);")
+
+        # NEWS JOURNAL — separate from signals: news is context, not a trade.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS news_journal (
+                news_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                source_url TEXT,
+                source_timestamp TEXT,
+                title TEXT,
+                status TEXT NOT NULL,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS news_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                news_id TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                attempted_at TEXT NOT NULL,
+                success INTEGER NOT NULL,
+                failure_reason TEXT,
+                metadata_json TEXT,
+                FOREIGN KEY(news_id) REFERENCES news_journal(news_id)
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_news_journal_status ON news_journal(status, source_timestamp);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_news_deliveries_news_id ON news_deliveries(news_id, attempted_at);")
+        cur.execute("""CREATE TABLE IF NOT EXISTS report_journal (
+            report_key TEXT PRIMARY KEY, report_type TEXT NOT NULL, period_start TEXT NOT NULL,
+            period_end TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, metadata_json TEXT)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS report_deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, report_key TEXT NOT NULL, destination TEXT NOT NULL,
+            attempted_at TEXT NOT NULL, success INTEGER NOT NULL, failure_reason TEXT, metadata_json TEXT)""")
+
         conn.commit()
         conn.close()
+
+    @staticmethod
+    def _ensure_columns(cur, table, columns):
+        existing = {row[1] for row in cur.execute(f"PRAGMA table_info({table})")}
+        for name, definition in columns.items():
+            if name not in existing:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+    # ==========================================================
+    # SIGNAL JOURNAL — persistence only, never strategy/risk logic
+    # ==========================================================
+
+    @staticmethod
+    def _redact_secrets(value):
+        if isinstance(value, Mapping):
+            redacted = {}
+            for key, item in value.items():
+                key_text = str(key).lower()
+                if any(marker in key_text for marker in ("token", "api_key", "apikey", "secret", "password")):
+                    redacted[str(key)] = "[REDACTED]"
+                else:
+                    redacted[str(key)] = DatabaseManager._redact_secrets(item)
+            return redacted
+        if isinstance(value, (list, tuple, set)):
+            return [DatabaseManager._redact_secrets(item) for item in value]
+        return value
+
+    @staticmethod
+    def _json(value):
+        return json.dumps(DatabaseManager._redact_secrets(value), ensure_ascii=False, default=str, separators=(",", ":"))
+
+    @staticmethod
+    def _value(payload, key, default=None):
+        if isinstance(payload, Signal):
+            return getattr(payload, key, default)
+        return payload.get(key, default)
+
+    def _journal_signal(self, payload: Signal | Mapping[str, object]):
+        """Extract supplied values for persistence without calculating a setup."""
+        if not isinstance(payload, (Signal, Mapping)):
+            raise TypeError("signal_payload_must_be_signal_or_mapping")
+
+        if isinstance(payload, Signal):
+            return {
+                "signal_id": payload.signal_id,
+                "asset_class": payload.asset_class.value,
+                "instrument_type": payload.instrument_type.value,
+                "symbol": payload.symbol,
+                "contract_symbol": payload.metadata.get("contract_symbol"),
+                "direction": payload.direction.value,
+                "strategy": payload.setup,
+                "entry": payload.entry,
+                "stop_loss": payload.stop_loss,
+                "targets": [payload.tp1, payload.tp2, payload.tp3],
+                "entry_timeframe": payload.entry_timeframe,
+                "source_timestamp": payload.source_timestamp.isoformat(),
+                "created_at": payload.signal_timestamp.isoformat(),
+                "status": "NEW",
+                "data_quality": payload.data_quality.value,
+                "rejection_reason": None,
+                "metadata": dict(payload.metadata),
+            }
+
+        direction_value = str(payload.get("direction") or payload.get("signal_type") or "").upper()
+        direction = next((item.value for item in Direction if item.value in direction_value), None)
+        asset_value = payload.get("asset_class")
+        if asset_value is None and direction in (Direction.CALL.value, Direction.PUT.value) and payload.get("contract_symbol"):
+            asset_value = AssetClass.OPTIONS.value
+        try:
+            asset_class = AssetClass(str(asset_value).upper())
+        except ValueError as error:
+            raise ValueError("journal_asset_class_required") from error
+        if direction is None:
+            raise ValueError("journal_direction_required")
+
+        instrument_value = payload.get("instrument_type")
+        if instrument_value is None:
+            instrument_value = InstrumentType.OPTION.value if asset_class is AssetClass.OPTIONS else InstrumentType.EQUITY.value
+        try:
+            instrument_type = InstrumentType(str(instrument_value).upper())
+        except ValueError as error:
+            raise ValueError("journal_instrument_type_invalid") from error
+
+        symbol = str(payload.get("symbol") or "").strip().upper()
+        if not symbol:
+            raise ValueError("journal_symbol_required")
+        strategy = str(payload.get("strategy") or payload.get("setup") or payload.get("approval") or f"LEGACY_{asset_class.value}")
+        timestamp_value = payload.get("signal_timestamp") or payload.get("created_at") or self.now().isoformat()
+        try:
+            signal_timestamp = datetime.fromisoformat(str(timestamp_value))
+        except ValueError:
+            signal_timestamp = self.now()
+        if signal_timestamp.tzinfo is None:
+            signal_timestamp = signal_timestamp.replace(tzinfo=self.now().tzinfo)
+
+        supplied_signal_id = payload.get("signal_id")
+        signal_id = str(supplied_signal_id) if supplied_signal_id else build_signal_id(
+            asset_class=asset_class,
+            instrument_type=instrument_type,
+            symbol=symbol,
+            direction=Direction(direction),
+            setup=strategy,
+            signal_timestamp=signal_timestamp.astimezone(timezone.utc),
+        )
+        targets = payload.get("targets") or [payload.get("tp1"), payload.get("tp2"), payload.get("tp3")]
+        return {
+            "signal_id": signal_id,
+            "asset_class": asset_class.value,
+            "instrument_type": instrument_type.value,
+            "symbol": symbol,
+            "contract_symbol": payload.get("contract_symbol"),
+            "direction": direction,
+            "strategy": strategy,
+            "entry": payload.get("entry", payload.get("entry_price")),
+            "stop_loss": payload.get("stop_loss", payload.get("sl", payload.get("stop"))),
+            "targets": targets,
+            "entry_timeframe": payload.get("entry_timeframe"),
+            "source_timestamp": payload.get("source_timestamp"),
+            "created_at": signal_timestamp.isoformat(),
+            "status": payload.get("status", "NEW"),
+            "data_quality": payload.get("data_quality"),
+            "rejection_reason": payload.get("rejection_reason"),
+            "metadata": payload.get("metadata", {}),
+        }
+
+    def record_signal(self, payload: Signal | Mapping[str, object]) -> tuple[str, bool]:
+        """Persist one ready signal and return (signal_id, inserted)."""
+        signal = self._journal_signal(payload)
+        conn = self.connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO signal_journal (
+                    signal_id, asset_class, instrument_type, symbol, contract_symbol,
+                    direction, strategy, entry, stop_loss, targets_json, entry_timeframe,
+                    source_timestamp, created_at, status, data_quality, rejection_reason,
+                    metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(signal_id) DO NOTHING
+            """, (
+                signal["signal_id"], signal["asset_class"], signal["instrument_type"], signal["symbol"], signal["contract_symbol"],
+                signal["direction"], signal["strategy"], signal["entry"], signal["stop_loss"], self._json(signal["targets"]),
+                signal["entry_timeframe"], signal["source_timestamp"], signal["created_at"], signal["status"], signal["data_quality"],
+                signal["rejection_reason"], self._json(signal["metadata"]),
+            ))
+            inserted = cur.rowcount == 1
+            cur.execute("""
+                INSERT INTO trade_journal (signal_id, status, opened_at, metadata_json)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(signal_id) DO NOTHING
+            """, (signal["signal_id"], signal["status"], signal["created_at"], self._json({})))
+            conn.commit()
+            return signal["signal_id"], inserted
+        finally:
+            conn.close()
+
+    def record_event(self, signal_id: str, event_type: str, *, event_timestamp=None, status="RECORDED", metadata=None):
+        """Append an event linked to its original signal/trade; no lifecycle logic."""
+        conn = self.connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM trade_journal WHERE signal_id = ?", (signal_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("journal_signal_not_found")
+            timestamp = event_timestamp or self.now().isoformat()
+            cur.execute("""
+                INSERT INTO signal_events (signal_id, trade_id, event_type, event_timestamp, status, metadata_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (signal_id, row[0], str(event_type), str(timestamp), status, self._json(metadata or {}), self.now().isoformat()))
+            event_id = cur.lastrowid
+            cur.execute("UPDATE trade_journal SET last_event_at = ? WHERE id = ?", (str(timestamp), row[0]))
+            conn.commit()
+            return event_id
+        finally:
+            conn.close()
+
+    def record_event_once(self, signal_id: str, event_type: str, event_key: str, *, event_timestamp=None, status="RECORDED", metadata=None):
+        """Persist an event once across restarts and return (event_id, inserted)."""
+        conn = self.connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM trade_journal WHERE signal_id = ?", (signal_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("journal_signal_not_found")
+            timestamp = event_timestamp or self.now().isoformat()
+            cur.execute("""
+                INSERT OR IGNORE INTO signal_events (
+                    signal_id, trade_id, event_type, event_key, event_timestamp,
+                    status, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                signal_id, row[0], str(event_type), event_key, str(timestamp), status,
+                self._json(metadata or {}), self.now().isoformat(),
+            ))
+            inserted = cur.rowcount == 1
+            if inserted:
+                event_id = cur.lastrowid
+                cur.execute("UPDATE trade_journal SET last_event_at = ? WHERE id = ?", (str(timestamp), row[0]))
+            else:
+                event_id = cur.execute(
+                    "SELECT id FROM signal_events WHERE signal_id = ? AND event_key = ?",
+                    (signal_id, event_key),
+                ).fetchone()[0]
+            conn.commit()
+            return event_id, inserted
+        finally:
+            conn.close()
+
+    def persist_trade_state(self, signal_id: str, trade: Mapping[str, object], *, price_timestamp=None, status=None, closed=False):
+        """Persist ready trade state atomically; it never calculates trade values."""
+        conn = self.connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM trade_journal WHERE signal_id = ?", (signal_id,))
+            if cur.fetchone() is None:
+                raise ValueError("journal_signal_not_found")
+            journal_status = status or str(trade.get("status") or "ACTIVE")
+            closed_at = self.now().isoformat() if closed else None
+            cur.execute("""
+                UPDATE trade_journal
+                SET status = ?, state_json = ?, last_price_timestamp = ?, closed_at = COALESCE(?, closed_at)
+                WHERE signal_id = ?
+            """, (
+                journal_status,
+                self._json(dict(trade)),
+                str(price_timestamp) if price_timestamp else None,
+                closed_at,
+                signal_id,
+            ))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_trade_state(self, signal_id: str):
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT state_json, status, last_price_timestamp, closed_at FROM trade_journal WHERE signal_id = ?",
+                (signal_id,),
+            ).fetchone()
+            if row is None or not row[0]:
+                return None
+            state = json.loads(row[0])
+            state.setdefault("status", row[1])
+            state.setdefault("last_price_timestamp", row[2])
+            state.setdefault("closed_at", row[3])
+            return state
+        finally:
+            conn.close()
+
+    def get_active_trade_states(self):
+        conn = self.connect()
+        try:
+            rows = conn.execute("""
+                SELECT signal_id, state_json, status, last_price_timestamp
+                FROM trade_journal
+                WHERE state_json IS NOT NULL AND closed_at IS NULL
+                ORDER BY id ASC
+            """).fetchall()
+            states = []
+            for signal_id, state_json, status, price_timestamp in rows:
+                state = json.loads(state_json)
+                state.setdefault("signal_id", signal_id)
+                state.setdefault("status", status)
+                state.setdefault("last_price_timestamp", price_timestamp)
+                states.append(state)
+            return states
+        finally:
+            conn.close()
+
+    def record_delivery(self, signal_id: str, destination, *, event_id=None, delivery_kind="TELEGRAM", success=False, failure_reason=None, metadata=None):
+        """Append a delivery attempt without storing credentials or message secrets."""
+        conn = self.connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM signal_journal WHERE signal_id = ?", (signal_id,))
+            if cur.fetchone() is None:
+                raise ValueError("journal_signal_not_found")
+            cur.execute("""
+                INSERT INTO signal_deliveries (
+                    signal_id, event_id, destination, delivery_kind, attempted_at,
+                    success, failure_reason, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                signal_id, event_id, str(destination), delivery_kind, self.now().isoformat(), int(bool(success)),
+                failure_reason, self._json(metadata or {}),
+            ))
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+    # ==========================================================
+    # NEWS JOURNAL — persistence/delivery only, never news scoring
+    # ==========================================================
+
+    @staticmethod
+    def build_news_id(news: Mapping[str, object]) -> str:
+        """Stable identity prefers provider URL, never the title alone."""
+        source = str(news.get("source") or "").strip().lower()
+        url = str(news.get("url") or "").strip()
+        published = str(news.get("timestamp") or news.get("published") or "").strip()
+        title = str(news.get("headline") or news.get("title") or "").strip().lower()
+        return hashlib.sha256("|".join((source, url or title, published)).encode("utf-8")).hexdigest()
+
+    def record_news(self, news: Mapping[str, object], *, status="FETCHED", metadata=None) -> str:
+        if not isinstance(news, Mapping):
+            raise TypeError("news_payload_must_be_mapping")
+        news_id = self.build_news_id(news)
+        source = str(news.get("source") or "").strip()
+        if not source:
+            raise ValueError("news_source_required")
+        now = self.now().isoformat()
+        conn = self.connect()
+        try:
+            conn.execute("""
+                INSERT INTO news_journal (news_id, source, source_url, source_timestamp, title, status, metadata_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(news_id) DO UPDATE SET
+                    status = CASE WHEN news_journal.status = 'SENT' THEN 'SENT' ELSE excluded.status END,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+            """, (news_id, source, str(news.get("url") or "") or None,
+                  str(news.get("timestamp") or news.get("published") or "") or None,
+                  str(news.get("headline") or news.get("title") or "") or None,
+                  str(status), self._json(metadata or {}), now, now))
+            conn.commit()
+            return news_id
+        finally:
+            conn.close()
+
+    def news_was_sent(self, news_id: str) -> bool:
+        conn = self.connect()
+        try:
+            row = conn.execute("SELECT status FROM news_journal WHERE news_id = ?", (news_id,)).fetchone()
+            return bool(row and row[0] == "SENT")
+        finally:
+            conn.close()
+
+    def update_news_status(self, news_id: str, status: str, *, metadata=None) -> None:
+        conn = self.connect()
+        try:
+            cur = conn.execute("UPDATE news_journal SET status = ?, metadata_json = ?, updated_at = ? WHERE news_id = ?",
+                               (str(status), self._json(metadata or {}), self.now().isoformat(), news_id))
+            if cur.rowcount != 1:
+                raise ValueError("news_journal_not_found")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def record_news_delivery(self, news_id: str, destination, *, success=False, failure_reason=None, metadata=None) -> int:
+        conn = self.connect()
+        try:
+            if conn.execute("SELECT 1 FROM news_journal WHERE news_id = ?", (news_id,)).fetchone() is None:
+                raise ValueError("news_journal_not_found")
+            cur = conn.execute("""
+                INSERT INTO news_deliveries (news_id, destination, attempted_at, success, failure_reason, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (news_id, str(destination), self.now().isoformat(), int(bool(success)), failure_reason, self._json(metadata or {})))
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+    def report_was_sent(self, report_key: str) -> bool:
+        conn = self.connect()
+        try:
+            row = conn.execute("SELECT status FROM report_journal WHERE report_key = ?", (report_key,)).fetchone()
+            return bool(row and row[0] == "SENT")
+        finally:
+            conn.close()
+
+    def record_report(self, report_key, report_type, period_start, period_end, *, status="READY", metadata=None):
+        conn = self.connect()
+        try:
+            conn.execute("""INSERT INTO report_journal (report_key, report_type, period_start, period_end, status, created_at, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(report_key) DO UPDATE SET status=excluded.status, metadata_json=excluded.metadata_json""",
+                (report_key, report_type, str(period_start), str(period_end), status, self.now().isoformat(), self._json(metadata or {})))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_signal_journal(self, signal_id: str):
+        conn = self.connect()
+        try:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM signal_journal WHERE signal_id = ?", (signal_id,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
 
     # ==========================================================
     # ADD USER — إضافة مستخدم جديد (مع حماية UNIQUE)

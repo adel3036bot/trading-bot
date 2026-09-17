@@ -2,8 +2,8 @@
 # IMAGE BUILDER
 # ==================================================
 
-from datetime import datetime
 from images.image_engine import ImageEngine
+from images.image_contract import normalize_trade_payload
 
 # إنشاء المحرك مرة واحدة فقط
 image_engine = ImageEngine()
@@ -18,27 +18,9 @@ def build_signal_image(trade):
     """
 
     try:
-        data = {
-            "company_name": trade.get("symbol", ""),
-            "symbol": trade.get("symbol", ""),
-            "contract_type": trade.get("signal_type", ""),
-            "strike": trade.get("strike", ""),
-            "contract_symbol": trade.get("contract_symbol", ""),
-            "entry_price": trade.get("entry", ""),
-            "expiry_date": trade.get("expiry", ""),
-            "signal_time": datetime.now().strftime("%I:%M %p EST"),
-            "rating": trade.get("contract_rating", ""),
-            "score": trade.get("score", ""),
-            "confidence": trade.get("confidence", ""),
-            "tp1": trade.get("tp1", ""),
-            "tp2": trade.get("tp2", ""),
-            "tp3": trade.get("tp3", ""),
-            "stop_loss": trade.get("sl", ""),
-            "trade_type": trade.get("trade_type", ""),
-            "status": trade.get("status", "NEW"),
-            "profit_percent": trade.get("profit", 0),
-            "approval": trade.get("approval", "")
-        }
+        # Compatibility entry point: adapt aliases only, never calculate or
+        # inject market/trade values that were not supplied by the caller.
+        data = normalize_trade_payload(trade)
 
         image_path = image_engine.build_image(
             "contract",

@@ -3,9 +3,11 @@
 # ============================================
 
 import asyncio
+import os
 from telegram import Bot
+from config import BOT_TOKEN as CONFIG_BOT_TOKEN
 
-BOT_TOKEN = "8603423824:AAGS2MJhU6ilzTuNgGfin00scoRzAQ7aeoo"
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", CONFIG_BOT_TOKEN)
 
 async def main():
     bot = Bot(token=BOT_TOKEN)

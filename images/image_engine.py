@@ -18,6 +18,17 @@ import pandas as pd
 import datetime
 import os
 import random
+from pathlib import Path
+
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+except ImportError:  # Rendering still degrades safely when optional deps are absent.
+    arabic_reshaper = None
+    get_display = None
+
+from core.events import EventType
+from images.image_contract import coerce_event_type, normalize_trade_payload, validate_event_payload
 
 # ============================================================
 # 1) IMAGE ENGINE — CORE RENDERER
@@ -25,6 +36,7 @@ import random
 
 class ImageEngine:
     def __init__(self):
+        self.project_root = Path(__file__).resolve().parents[1]
         # إعدادات عامة
         self.config = {
             "canvas_width": 1400,
@@ -38,17 +50,21 @@ class ImageEngine:
         }
 
         # إعدادات الخطوط
-        self.font_large = ImageFont.truetype("fonts/regular.ttf", self.config["font_large"])
-        self.font_medium = ImageFont.truetype("fonts/regular.ttf", self.config["font_medium"])
-        self.font_small = ImageFont.truetype("fonts/regular.ttf", self.config["font_small"])
-        self.font_bold = ImageFont.truetype("fonts/bold.ttf", self.config["font_large"])
+        regular_font = self.project_root / "fonts" / "regular.ttf"
+        bold_font = self.project_root / "fonts" / "bold.ttf"
+        self.font_large = ImageFont.truetype(str(regular_font), self.config["font_large"])
+        self.font_medium = ImageFont.truetype(str(regular_font), self.config["font_medium"])
+        self.font_small = ImageFont.truetype(str(regular_font), self.config["font_small"])
+        self.font_bold = ImageFont.truetype(str(bold_font), self.config["font_large"])
 
         # الشعار العام (إن وجد)
-        self.logo = Image.open("templates/logo.png").convert("RGBA") if os.path.exists("templates/logo.png") else None
+        logo_path = self.project_root / "templates" / "logo.png"
+        self.logo = Image.open(logo_path).convert("RGBA") if logo_path.exists() else None
 
         # العلامة المائية (إن وجدت)
-        if os.path.exists("templates/watermark.png"):
-            self.watermark = Image.open("templates/watermark.png").convert("RGBA")
+        watermark_path = self.project_root / "templates" / "watermark.png"
+        if watermark_path.exists():
+            self.watermark = Image.open(watermark_path).convert("RGBA")
             self.watermark.putalpha(self.config["watermark_alpha"])
         else:
             self.watermark = None
@@ -66,15 +82,15 @@ class ImageEngine:
 
         # خريطة الأيقونات الديناميكية
         self.icon_map = {
-            "CALL": "icons/call.png",
-            "PUT": "icons/put.png",
-            "NEWS": "icons/news.png",
-            "WARNING": "icons/warning.png",
-            "SUCCESS": "icons/success.png",
-            "FAILURE": "icons/failure.png",
-            "EARNINGS": "icons/earnings.png",
-            "HIGH_RISK": "icons/high_risk.png",
-            "HIGH_CONFIDENCE": "icons/high_confidence.png",
+            "CALL": str(self.project_root / "icons" / "call.png"),
+            "PUT": str(self.project_root / "icons" / "put.png"),
+            "NEWS": str(self.project_root / "icons" / "news.png"),
+            "WARNING": str(self.project_root / "icons" / "warning.png"),
+            "SUCCESS": str(self.project_root / "icons" / "success.png"),
+            "FAILURE": str(self.project_root / "icons" / "failure.png"),
+            "EARNINGS": str(self.project_root / "icons" / "earnings.png"),
+            "HIGH_RISK": str(self.project_root / "icons" / "high_risk.png"),
+            "HIGH_CONFIDENCE": str(self.project_root / "icons" / "high_confidence.png"),
         }
 
         # إحداثيات الحقول لكل قالب
@@ -299,6 +315,19 @@ class ImageEngine:
     # --------------------------------------------------------
     # رسم بلوك نصي (RTL / LTR)
     # --------------------------------------------------------
+    def prepare_rtl_text(self, text: str) -> str:
+        """Prepare logical Arabic/Latin text for Pillow's non-RAQM renderer.
+
+        Payload values remain logical Unicode everywhere outside this
+        presentation boundary. Cairo provides the Arabic glyphs; reshaping
+        and BiDi ordering are required here because this Pillow build has no
+        native RAQM/FriBidi text-layout support.
+        """
+        text = self.clean_text(text)
+        if arabic_reshaper and get_display:
+            return get_display(arabic_reshaper.reshape(text))
+        return text
+
     def draw_text_block(self, img, text, x, y, max_width=None, rtl=True):
         text = self.clean_text(text)
         font = self.responsive_font(text)
@@ -311,7 +340,11 @@ class ImageEngine:
 
         for line in wrapped:
             if rtl:
-                draw.text((x, y), line, font=font, fill="white", anchor="ra")
+                # PIL does not shape Arabic glyphs by itself.  Shape only at
+                # presentation time; the News/Signal payload remains logical
+                # Unicode and keeps symbols/numbers intact for Telegram.
+                display_line = self.prepare_rtl_text(line)
+                draw.text((x, y), display_line, font=font, fill="white", anchor="ra")
             else:
                 draw.text((x, y), line, font=font, fill="white")
             y += self.config["line_height"]
@@ -477,7 +510,7 @@ class ImageEngine:
             "وليست توصية مباشرة للشراء أو البيع."
         )
 
-        font_warn = ImageFont.truetype("fonts/regular.ttf", 26)
+        font_warn = ImageFont.truetype(str(self.project_root / "fonts" / "regular.ttf"), 26)
         draw = ImageDraw.Draw(img)
         draw.text((w // 2, h - 110), warning_text, font=font_warn, fill="#ffcc00", anchor="mm")
 
@@ -487,6 +520,8 @@ class ImageEngine:
     # بناء صورة القالب حسب النوع والبيانات
     # --------------------------------------------------------
     def build_template_image(self, template_type, data):
+        if template_type == "contract":
+            return self._build_contract_signal(data)
         base = self._draw_background(template_type)
         img = self.merge_common_elements(base, data)
 
@@ -497,15 +532,62 @@ class ImageEngine:
 
         return img
 
+    def _build_contract_signal(self, data):
+        """Options card renderer. Values are ready payload values only."""
+        w, h = 1400, 1600
+        img = Image.new("RGBA", (w, h), "#05070d")
+        draw = ImageDraw.Draw(img)
+        blue, green, red, gold, purple = "#158cff", "#16c784", "#dc3545", "#d9a928", "#8e44ff"
+        draw.rounded_rectangle((28, 28, w - 28, h - 28), 28, outline=blue, width=4)
+        draw.line((60, 180, w - 60, 180), fill=blue, width=2)
+        draw.text((w // 2, 72), "ADEL SMART BOT ELITE", font=self.font_bold, fill="white", anchor="ma")
+        draw.text((w // 2, 128), "عقد مقترح للمراقبة", font=self.font_medium, fill=gold, anchor="ma")
+        name = data.get("company_name") or data.get("symbol") or "—"
+        symbol = data.get("symbol", "—")
+        draw.text((80, 235), str(name), font=self.font_bold, fill="white")
+        draw.text((80, 295), str(symbol), font=self.font_medium, fill=blue)
+        rating = str(data.get("rating") or "—")
+        draw.rounded_rectangle((1060, 220, 1300, 350), 20, outline=purple, width=3)
+        draw.text((1180, 245), "التقييم", font=self.font_small, fill="white", anchor="ma")
+        draw.text((1180, 290), rating, font=self.font_bold, fill=purple, anchor="ma")
+        fields = [
+            ("سعر الدخول", data.get("entry_price"), blue),
+            ("تاريخ الانتهاء", data.get("expiry_date"), gold),
+            ("نوع العقد", data.get("contract_type"), green if str(data.get("contract_type", "")).upper() == "CALL" else red),
+            ("العقد / Strike", f"{data.get('contract_style', '')} {data.get('strike', '')}", "white"),
+        ]
+        y = 390
+        for label, value, color in fields:
+            draw.rounded_rectangle((70, y, 1330, y + 105), 16, outline="#34445f", width=2)
+            draw.text((1280, y + 18), label, font=self.font_small, fill="#a9c7ef", anchor="ra")
+            draw.text((1280, y + 55), str(value or "—"), font=self.font_medium, fill=color, anchor="ra")
+            y += 125
+        draw.text((1280, 900), "الأهداف", font=self.font_medium, fill=green, anchor="ra")
+        for i, key in enumerate(("tp1", "tp2", "tp3")):
+            yy = 950 + i * 80
+            draw.rounded_rectangle((70, yy, 860, yy + 58), 12, outline=green, width=2)
+            draw.text((810, yy + 10), f"TP{i + 1}: {data.get(key) or '—'}", font=self.font_small, fill=green, anchor="ra")
+        draw.rounded_rectangle((890, 950, 1330, 1168), 16, outline=red, width=3)
+        draw.text((1280, 980), "وقف الخسارة", font=self.font_small, fill=red, anchor="ra")
+        draw.text((1280, 1040), str(data.get("stop_loss") or "—"), font=self.font_bold, fill=red, anchor="ra")
+        draw.text((1280, 1220), "حالة السوق", font=self.font_small, fill="#a9c7ef", anchor="ra")
+        draw.text((1280, 1265), str(data.get("market_index") or "SPX | QQQ | SPY | NASDAQ: غير متاح"), font=self.font_small, fill="white", anchor="ra")
+        draw.text((1280, 1325), f"وقت الإشارة: {data.get('signal_time') or '—'}", font=self.font_small, fill="#a9c7ef", anchor="ra")
+        note = data.get("important_notes") or data.get("disclaimer")
+        if note:
+            draw.text((1280, 1430), str(note), font=self.font_small, fill="#d5dce8", anchor="ra")
+        return img
+
     # --------------------------------------------------------
     # التصدير إلى ملف
     # --------------------------------------------------------
     def export(self, img, filename=None):
         if filename is None:
-            filename = f"output/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
-        img.save(filename)
-        return filename
+            filename = self.project_root / "output" / f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        output_path = Path(filename)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        img.save(output_path)
+        return str(output_path)
 
     # --------------------------------------------------------
     # بناء صورة كاملة مباشرة
@@ -518,12 +600,9 @@ class ImageEngine:
     # TRADE EVENT → IMAGE GENERATOR (TP / SL / MOONSHOT / LEGENDARY / GOD MODE / OPEN PROFIT)
     # ============================================================
     def generate(self, event_type, trade, filename=None):
-        # دعم تمرير event_type كسلسلة أو كـ Enum
-        if isinstance(event_type, str):
-            try:
-                event_type = EventType(event_type)
-            except ValueError:
-                pass
+        event_type = coerce_event_type(event_type)
+        trade = normalize_trade_payload(trade)
+        validate_event_payload(event_type, trade)
 
         template_type = "contract"
         data = {}
@@ -532,7 +611,7 @@ class ImageEngine:
         symbol = trade.get("symbol", "")
         entry_price = trade.get("entry_price")
         current_price = trade.get("current_price")
-        profit = trade.get("profit", 0.0)
+        profit = trade.get("profit")
         market_index = trade.get("market_index", "")
         signal_time = trade.get("signal_time", "")
         expiry_date = trade.get("expiry_date", "")
@@ -547,7 +626,7 @@ class ImageEngine:
                 "tp_level": tp_label,
                 "entry_price": entry_price,
                 "current_price": current_price,
-                "profit_percent": f"{profit:.2f}%",
+                "profit_percent": f"{profit:.2f}%" if isinstance(profit, (int, float)) else "",
                 "signal_time": signal_time,
                 "market_index": market_index,
                 "status": "Hit",
@@ -563,7 +642,7 @@ class ImageEngine:
                 "entry_price": entry_price,
                 "stop_loss": trade.get("stop_loss"),
                 "current_price": current_price,
-                "loss_percent": f"{profit:.2f}%",
+                "loss_percent": f"{profit:.2f}%" if isinstance(profit, (int, float)) else "",
                 "signal_time": signal_time,
                 "market_index": market_index,
                 "status": "Stopped",
@@ -576,11 +655,11 @@ class ImageEngine:
             data = {
                 "title": "MOONSHOT ALERT 🚀",
                 "symbol": symbol,
-                "reason": trade.get("reason", "فرصة استثنائية عالية الزخم."),
+                "reason": trade.get("reason", ""),
                 "entry_price": entry_price,
                 "targets": trade.get("targets", ""),
-                "risk": trade.get("risk", "مرتفع"),
-                "summary": f"الربح الحالي: {profit:.2f}%",
+                "risk": trade.get("risk", ""),
+                "summary": f"الربح الحالي: {profit:.2f}%" if isinstance(profit, (int, float)) else "",
             }
 
         # LEGENDARY
@@ -591,8 +670,8 @@ class ImageEngine:
                 "symbol": symbol,
                 "entry_price": entry_price,
                 "exit_price": current_price,
-                "profit_percent": f"{profit:.2f}%",
-                "summary": trade.get("summary", "صفقة أسطورية حققت عائدًا استثنائيًا."),
+                "profit_percent": f"{profit:.2f}%" if isinstance(profit, (int, float)) else "",
+                "summary": trade.get("summary", ""),
             }
 
         # GOD MODE
@@ -603,8 +682,8 @@ class ImageEngine:
                 "symbol": symbol,
                 "entry_price": entry_price,
                 "current_price": current_price,
-                "profit_percent": f"{profit:.2f}%",
-                "summary": trade.get("summary", "الصفقة دخلت مرحلة GOD MODE مع ربح غير اعتيادي."),
+                "profit_percent": f"{profit:.2f}%" if isinstance(profit, (int, float)) else "",
+                "summary": trade.get("summary", ""),
             }
 
         # OPEN PROFIT
@@ -614,8 +693,8 @@ class ImageEngine:
                 "title": "📈 OPEN PROFIT",
                 "symbol": symbol,
                 "current_price": current_price,
-                "profit_percent": f"{profit:.2f}%",
-                "summary": "الصفقة مستمرة في تحقيق أرباح مفتوحة.",
+                "profit_percent": f"{profit:.2f}%" if isinstance(profit, (int, float)) else "",
+                "summary": trade.get("summary", ""),
             }
 
         # PROGRESS UPDATE
@@ -623,17 +702,17 @@ class ImageEngine:
             template_type = "performance"
             data = {
                 "title": "تقدم الصفقة",
-                "date": datetime.datetime.now().strftime("%Y-%m-%d"),
-                "total_trades": 1,
-                "winning_trades": 1 if profit > 0 else 0,
-                "losing_trades": 1 if profit <= 0 else 0,
-                "win_rate": 100.0 if profit > 0 else 0.0,
-                "average_profit": profit,
-                "total_profit": profit,
-                "moon_shots": 0,
-                "legendary_trades": 0,
-                "best_symbol": symbol,
-                "summary": trade.get("progress_text", "تحديث على تقدم الصفقة الحالية."),
+                "date": trade.get("date") or signal_time,
+                "total_trades": trade.get("total_trades"),
+                "winning_trades": trade.get("winning_trades"),
+                "losing_trades": trade.get("losing_trades"),
+                "win_rate": trade.get("win_rate"),
+                "average_profit": trade.get("average_profit"),
+                "total_profit": trade.get("total_profit"),
+                "moon_shots": trade.get("moon_shots"),
+                "legendary_trades": trade.get("legendary_trades"),
+                "best_symbol": trade.get("best_symbol"),
+                "summary": trade.get("progress_text", ""),
             }
 
         # DEFAULT CONTRACT
@@ -654,7 +733,7 @@ class ImageEngine:
                 "tp2": trade.get("tp2", ""),
                 "tp3": trade.get("tp3", ""),
                 "stop_loss": trade.get("stop_loss", ""),
-                "profit_percent": f"{profit:.2f}%",
+                "profit_percent": f"{profit:.2f}%" if isinstance(profit, (int, float)) else "",
                 "market_index": market_index,
                 "disclaimer": "هذه قراءة فنية تعليمية وليست توصية مباشرة.",
             }

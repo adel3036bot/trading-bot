@@ -9,10 +9,19 @@ from core.events import EventType
 
 def update_trade(trade, current_price):
 
+    # A closed trade is immutable for lifecycle purposes; otherwise a later
+    # price tick could overwrite a final STOP LOSS status with UPDATE.
+    if trade.get("is_closed"):
+        return trade
+
     entry = trade["entry"]
 
+    # Options CALL/PUT are monitored by contract price and remain long-price
+    # positions. Only a direct SELL signal uses inverse price geometry.
+    is_short = str(trade.get("direction", "")).upper() == "SELL"
+
     profit = round(
-        ((current_price - entry) / entry) * 100,
+        (((entry - current_price) if is_short else (current_price - entry)) / entry) * 100,
         2
     )
 
@@ -51,17 +60,21 @@ def update_trade(trade, current_price):
     # ==========================================
     # STOP LOSS
     # ==========================================
-    if current_price <= trade["sl"] and trade["stage"] >= 0:
+    stop_hit = current_price >= trade["sl"] if is_short else current_price <= trade["sl"]
+    if stop_hit and trade["stage"] >= 0:
 
         trade["stage"] = -1
         trade["status"] = "STOP LOSS"
+        trade["is_closed"] = True
+        trade["closed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         return trade
 
     # ==========================================
     # TP1
     # ==========================================
-    if current_price >= trade["tp1"] and trade["stage"] == 0:
+    tp1_hit = current_price <= trade["tp1"] if is_short else current_price >= trade["tp1"]
+    if tp1_hit and trade["stage"] == 0:
 
         trade["stage"] = 1
         trade["status"] = "TP1 HIT"
@@ -74,7 +87,8 @@ def update_trade(trade, current_price):
     # ==========================================
     # TP2
     # ==========================================
-    if current_price >= trade["tp2"] and trade["stage"] == 1:
+    tp2_hit = current_price <= trade["tp2"] if is_short else current_price >= trade["tp2"]
+    if tp2_hit and trade["stage"] == 1:
 
         trade["stage"] = 2
         trade["status"] = "TP2 HIT"
@@ -87,7 +101,8 @@ def update_trade(trade, current_price):
     # ==========================================
     # TP3
     # ==========================================
-    if current_price >= trade["tp3"] and trade["stage"] == 2:
+    tp3_hit = current_price <= trade["tp3"] if is_short else current_price >= trade["tp3"]
+    if tp3_hit and trade["stage"] == 2:
 
         trade["stage"] = 3
         trade["status"] = "TARGET ACHIEVED"
@@ -933,6 +948,18 @@ def build_message(event):
     # ==========================
     # Trade Events
     # ==========================
+
+    if et == EventType.NEW_TRADE:
+        # The legacy opener requires its older presentation payload.  Preserve
+        # its approved text whenever present, otherwise retain the existing
+        # generic fallback instead of inventing missing presentation data.
+        try:
+            return get_trade_open_message(trade)
+        except KeyError:
+            return "📌 رسالة غير معروفة"
+
+    if et == EventType.TRADE_CLOSED:
+        return get_close_trade_message(trade)
 
     if et == EventType.TP1:
         return get_tp1_message(trade)

@@ -36,7 +36,7 @@ import logging
 import requests
 import pandas as pd
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ==================================================
 # CONFIG
@@ -559,6 +559,158 @@ class MassiveProvider:
             candles=candles
 
         )
+
+    # ==================================================
+    # OPTION CHAIN SNAPSHOT
+    # ==================================================
+
+    @staticmethod
+    def _option_timestamp(value):
+        """Convert provider epoch timestamps to UTC ISO strings without guessing."""
+        if value is None:
+            return None
+        try:
+            timestamp = int(value)
+            if timestamp > 10**17:
+                timestamp /= 10**9
+            elif timestamp > 10**14:
+                timestamp /= 10**6
+            elif timestamp > 10**11:
+                timestamp /= 10**3
+            return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+
+    @staticmethod
+    def _option_timestamp_is_fresh(value, max_age_seconds):
+        """Accept only provider timestamps inside the requested freshness window."""
+        if value is None:
+            return False
+
+        try:
+            timestamp = int(value)
+            if timestamp > 10**17: timestamp /= 10**9
+            elif timestamp > 10**14: timestamp /= 10**6
+            elif timestamp > 10**11: timestamp /= 10**3
+            age = datetime.now(timezone.utc).timestamp() - timestamp
+            return 0 <= age <= max_age_seconds
+        except (TypeError, ValueError, OSError, OverflowError):
+            return False
+
+    def iter_reference_tickers(self, *, max_pages=None, limit=1000):
+        """Provider-only pagination; UniverseEngine never calls this directly."""
+        url = f"{self.base_url}/v3/reference/tickers"
+        pages = 0
+        while url and (max_pages is None or pages < max_pages):
+            response = requests.get(url, params={"market":"stocks","active":"true","limit":limit,"apiKey":self.api_key}, timeout=self.timeout)
+            if response.status_code != 200:
+                self.last_error = f"HTTP {response.status_code}"; return
+            payload = response.json()
+            for item in payload.get("results", []): yield item
+            url = payload.get("next_url")
+            if url and "apiKey=" not in url: url = f"{url}{'&' if '?' in url else '?'}apiKey={self.api_key}"
+            pages += 1
+
+    def _normalize_option_contract(self, raw, underlying, require_realtime, max_age_seconds):
+        """Normalize a real contract only; underlying OHLCV is never accepted."""
+        details = raw.get("details") or {}
+        quote = raw.get("last_quote") or {}
+        trade = raw.get("last_trade") or {}
+        day = raw.get("day") or {}
+        quote_timeframe = quote.get("timeframe")
+        trade_timeframe = trade.get("timeframe")
+        is_realtime = quote_timeframe == "REAL-TIME" and trade_timeframe == "REAL-TIME"
+        if require_realtime and not is_realtime:
+            return None
+        if require_realtime and not (
+            self._option_timestamp_is_fresh(quote.get("last_updated"), max_age_seconds)
+            and self._option_timestamp_is_fresh(trade.get("sip_timestamp"), max_age_seconds)
+        ):
+            return None
+
+        contract = {
+            "contractSymbol": details.get("ticker"),
+            "underlying": (raw.get("underlying_asset") or {}).get("ticker", underlying),
+            "contractType": (details.get("contract_type") or "").upper(),
+            "strike": details.get("strike_price"),
+            "expiry": details.get("expiration_date"),
+            "bid": quote.get("bid"),
+            "ask": quote.get("ask"),
+            "lastPrice": trade.get("price"),
+            "volume": day.get("volume"),
+            "openInterest": raw.get("open_interest"),
+            "impliedVolatility": raw.get("implied_volatility"),
+            "quoteTimestamp": self._option_timestamp(quote.get("last_updated")),
+            "tradeTimestamp": self._option_timestamp(trade.get("sip_timestamp")),
+            "quoteTimeframe": quote_timeframe,
+            "tradeTimeframe": trade_timeframe,
+            "isRealtime": is_realtime,
+        }
+        required = ("contractSymbol", "contractType", "strike", "expiry", "bid", "ask", "lastPrice", "volume", "openInterest", "quoteTimestamp", "tradeTimestamp")
+        if any(contract[field] is None for field in required):
+            return None
+        if contract["contractType"] not in ("CALL", "PUT"):
+            return None
+        if any(float(contract[field]) < 0 for field in ("bid", "ask", "lastPrice", "volume", "openInterest")):
+            return None
+        return contract
+
+    def get_option_chain_data(
+        self,
+        symbol: str,
+        *,
+        require_realtime: bool = True,
+        max_age_seconds: int = 120,
+    ):
+        """Return a real Option Chain snapshot, never underlying OHLCV data."""
+        symbol = self.normalize_symbol(symbol)
+        url = f"{self.base_url}/v3/snapshot/options/{symbol}"
+        params = {"limit": 250, "order": "asc", "sort": "ticker", "apiKey": self.api_key}
+        calls, puts = [], []
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        try:
+            while url:
+                response = requests.get(url, params=params, timeout=self.timeout)
+                params = None
+                if response.status_code != 200:
+                    self.connected = False
+                    self.last_error = f"HTTP {response.status_code}"
+                    logger.warning("[%s] Option Chain unavailable for %s: %s", self.provider_name, symbol, self.last_error)
+                    return None
+                payload = response.json()
+                for raw in payload.get("results") or []:
+                    contract = self._normalize_option_contract(
+                        raw,
+                        symbol,
+                        require_realtime,
+                        max_age_seconds,
+                    )
+                    if contract is None:
+                        continue
+                    (calls if contract["contractType"] == "CALL" else puts).append(contract)
+                url = payload.get("next_url")
+                if url:
+                    separator = "&" if "?" in url else "?"
+                    url = f"{url}{separator}apiKey={self.api_key}"
+            if not calls and not puts:
+                self.last_error = "No reliable option contracts"
+                return None
+            self.connected = True
+            self.last_error = None
+            return {
+                "underlying": symbol,
+                "source": self.provider_name,
+                "fetchedAt": fetched_at,
+                "isRealtime": require_realtime,
+                "expiries": sorted({contract["expiry"] for contract in calls + puts}),
+                "calls": calls,
+                "puts": puts,
+            }
+        except (requests.RequestException, ValueError, TypeError, AttributeError) as error:
+            self.connected = False
+            self.last_error = str(error)
+            logger.warning("[%s] Option Chain request failed for %s: %s", self.provider_name, symbol, error)
+            return None
 
 
     def get_crypto_data(

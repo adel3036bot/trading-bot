@@ -1,3 +1,6 @@
 config.py
+adel_smart_bot.db
 __pycache__/
-*.pyc
+*.pyc*
+output/*.png
+tests/tmp*/

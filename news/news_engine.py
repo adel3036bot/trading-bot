@@ -4,22 +4,26 @@
 # ==================================================
 
 from collections import deque
+from datetime import datetime, timedelta, timezone
 import logging
 
 from news.news_provider import NewsProvider
 from news.news_filter import NewsFilter
 from news.news_editor import NewsEditor
 from news.news_formatter import NewsFormatter
+from database.database import DatabaseManager
 
 
 class NewsEngine:
 
-    def __init__(self):
+    def __init__(self, provider=None, news_filter=None, editor=None, formatter=None, journal=None):
 
-        self.provider = NewsProvider()
-        self.filter = NewsFilter()
-        self.editor = NewsEditor()
-        self.formatter = NewsFormatter()
+        self.provider = provider or NewsProvider()
+        self.filter = news_filter or NewsFilter()
+        self.editor = editor or NewsEditor()
+        self.formatter = formatter or NewsFormatter()
+        self.journal = journal or DatabaseManager()
+        self.max_news_age = timedelta(hours=48)
 
         self.sent_history = set()
         self.queue = deque()
@@ -33,12 +37,25 @@ class NewsEngine:
     # ==================================================
 
     def generate_news_id(self, news):
+        return self.journal.build_news_id(news)
 
-        headline = news.get("headline", news.get("title", "")).strip().lower()
-        source = news.get("source", "").strip().lower()
-        published = news.get("timestamp", news.get("published", "")).strip()
+    @staticmethod
+    def _parse_timestamp(news):
+        value = news.get("timestamp") or news.get("published")
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed.tzinfo else None
 
-        return f"{source}|{headline}|{published}"
+    def has_reliable_timestamp(self, news):
+        published = self._parse_timestamp(news)
+        if published is None:
+            return False
+        now = datetime.now(timezone.utc)
+        return now - self.max_news_age <= published.astimezone(timezone.utc) <= now + timedelta(minutes=5)
 
     def is_duplicate(self, news):
 
@@ -47,20 +64,52 @@ class NewsEngine:
         if nid in self.sent_history:
             return True
 
+        try:
+            if self.journal.news_was_sent(nid):
+                return True
+        except Exception as error:
+            # Database persistence is a reliability improvement; a temporary
+            # journal read failure must not stop independent source processing.
+            logging.error("News journal dedup lookup failed: %s", error)
+
         for item in self.queue:
             if self.generate_news_id(item) == nid:
                 return True
 
         return False
 
-    def mark_as_sent(self, news):
-        self.sent_history.add(self.generate_news_id(news))
+    def mark_as_sent(self, news, *, destination="DEFAULT", success=True, failure_reason=None):
+        """Record delivery independently; a failed delivery is never marked sent."""
+        if not news:
+            return False
+        try:
+            news_id = self.journal.record_news(news, status="APPROVED")
+            self.journal.record_news_delivery(news_id, destination, success=success, failure_reason=failure_reason)
+            if success:
+                self.journal.update_news_status(news_id, "SENT")
+                self.sent_history.add(news_id)
+                return True
+            self.journal.update_news_status(news_id, "DELIVERY_FAILED", metadata={"reason": failure_reason})
+        except Exception as error:
+            logging.error("News delivery journal failed: %s", error)
+        return False
+
+    def record_delivery_failure(self, news, *, destination="DEFAULT", reason="telegram_delivery_failed"):
+        return self.mark_as_sent(news, destination=destination, success=False, failure_reason=reason)
 
     # ==================================================
     # QUEUE ENGINE
     # ==================================================
 
     def add_to_queue(self, news):
+
+        if not self.has_reliable_timestamp(news):
+            try:
+                news_id = self.journal.record_news(news, status="REJECTED_TIMESTAMP")
+                self.journal.update_news_status(news_id, "REJECTED_TIMESTAMP")
+            except Exception as error:
+                logging.error("News timestamp journal failed: %s", error)
+            return False
 
         if self.is_duplicate(news):
             return False
@@ -93,7 +142,13 @@ class NewsEngine:
     # ==================================================
 
     def fetch_news(self):
-        return self.provider.get_news()
+        raw = self.provider.get_news()
+        for item in raw or []:
+            try:
+                self.journal.record_news(item, status="FETCHED")
+            except Exception as error:
+                logging.error("News fetch journal failed: %s", error)
+        return raw
 
     def classify_news(self, raw):
         return self.filter.classify_news_list(raw)
@@ -105,12 +160,25 @@ class NewsEngine:
 
         edited = self.editor.clean_and_translate(news)
 
+        if edited.get("translation_status") == "FAILED":
+            try:
+                news_id = self.journal.record_news(news, status="FAILED_TRANSLATION")
+                self.journal.update_news_status(news_id, "FAILED_TRANSLATION", metadata={"reason": edited.get("translation_error")})
+            except Exception as error:
+                logging.error("News translation journal failed: %s", error)
+            return None
+
+        try:
+            self.journal.record_news(news, status="TRANSLATED", metadata={"priority": news.get("priority"), "breaking": news.get("breaking", False)})
+        except Exception as error:
+            logging.error("News journal write failed: %s", error)
+
         # ------------------------------
         # IMAGE DATA (for ImageEngine)
         # ------------------------------
         image_data = {
             "headline": edited.get("title", ""),
-            "body": edited.get("translated", edited.get("summary", "")),
+            "body": edited.get("translated", ""),
             "category": edited.get("category", "غير مصنف"),
             "session": edited.get("session", "غير محدد"),
             "timestamp": edited.get("published", ""),
@@ -165,7 +233,24 @@ class NewsEngine:
         classified = self.classify_news(raw)
         important = self.filter_important(classified)
 
-        filtered = [n for n in important if n.get("session") == session_mode]
+        # Providers deliver source facts, not Telegram session labels.  Attach
+        # the caller's delivery context here; this fixes the previous empty
+        # PRE_MARKET/MARKET_OPEN lists without inferring a market direction.
+        filtered = [
+            {**n, "session": session_mode}
+            for n in important
+            if (not n.get("session") or n.get("session") == session_mode)
+            and self.has_reliable_timestamp(n)
+            and not self.is_duplicate(n)
+        ]
+
+        for item in important:
+            if not self.has_reliable_timestamp(item):
+                try:
+                    news_id = self.journal.record_news(item, status="REJECTED_TIMESTAMP")
+                    self.journal.update_news_status(news_id, "REJECTED_TIMESTAMP")
+                except Exception as error:
+                    logging.error("News timestamp journal failed: %s", error)
         unique = [n for n in filtered if not self.is_duplicate(n)]
 
         if not unique:
@@ -182,7 +267,9 @@ class NewsEngine:
         structured_list = []
 
         for item in sorted_news:
-            structured_list.append(self.prepare_structured(item))
+            prepared = self.prepare_structured(item)
+            if prepared:
+                structured_list.append(prepared)
 
         return structured_list
 
@@ -194,6 +281,19 @@ class NewsEngine:
 
     def after_market_structured(self):
         return self.run_internal_structured("AFTER_MARKET")
+
+    # Compatibility belongs to NewsEngine, not to DailyScheduler monkey patches.
+    def _legacy_messages(self, structured):
+        return [{"message": item.get("text", ""), "raw": item.get("raw")} for item in structured or [] if isinstance(item, dict)]
+
+    def morning_news(self):
+        return self._legacy_messages(self.morning_news_structured())
+
+    def breaking_news(self):
+        return self._legacy_messages(self.breaking_news_structured())
+
+    def after_market_news(self):
+        return self._legacy_messages(self.after_market_structured())
 
     # ==================================================
     # MORNING REPORT (STRUCTURED)

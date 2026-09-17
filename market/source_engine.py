@@ -956,23 +956,75 @@ def get_crypto_data(
     )
 
 
+def request_option_chain(symbol: str, *, require_realtime: bool = True):
+    """Request only a normalized Option Chain from option-capable providers.
+
+    This deliberately does not call ``request_market_data``: OHLCV for an
+    underlying stock is never a valid fallback for an option contract.
+    """
+    symbol = SYMBOL_MAP.get(symbol.upper(), symbol.upper())
+
+    for provider_name in provider_order():
+        provider = get_provider(provider_name)
+        if provider is None:
+            continue
+
+        fetch_chain = getattr(provider, "get_option_chain_data", None)
+        if not callable(fetch_chain):
+            continue
+
+        try:
+            try:
+                chain = fetch_chain(symbol, require_realtime=require_realtime)
+            except TypeError:
+                # Existing providers that have no real-time argument remain
+                # compatible, but still must return a chain (never OHLCV).
+                chain = fetch_chain(symbol)
+        except Exception as error:
+            logger.warning("[OPTION CHAIN] %s failed for %s: %s", provider_name, symbol, error)
+            increase_failed(provider_name)
+            continue
+
+        if not isinstance(chain, dict):
+            increase_failed(provider_name)
+            continue
+        if not isinstance(chain.get("calls"), list) or not isinstance(chain.get("puts"), list):
+            logger.warning("[OPTION CHAIN] %s returned an invalid contract payload for %s", provider_name, symbol)
+            increase_failed(provider_name)
+            continue
+        if require_realtime and (chain.get("isRealtime") is not True or not chain.get("fetchedAt")):
+            logger.warning("[OPTION CHAIN] %s did not prove real-time freshness for %s", provider_name, symbol)
+            increase_failed(provider_name)
+            continue
+        if not chain["calls"] and not chain["puts"]:
+            increase_failed(provider_name)
+            continue
+
+        chain.setdefault("underlying", symbol)
+        chain.setdefault("source", provider_name)
+        increase_success(provider_name)
+        return chain
+
+    logger.warning("[OPTION CHAIN] No reliable Option Chain available for %s", symbol)
+    return None
+
+
 def get_option_data(
 
     symbol: str,
     timeframe: str = "1D",
-    candles: int = MIN_HISTORY_ROWS
+    candles: int = MIN_HISTORY_ROWS,
+    *,
+    require_realtime: bool = True
 
 ):
+    """Compatibility entry point for Option Chain consumers.
 
-    return request_market_data(
-
-        symbol=symbol,
-
-        timeframe=timeframe,
-
-        candles=candles
-
-    )
+    ``timeframe`` and ``candles`` are retained only for callers using the old
+    signature; an Option Chain is a snapshot, not an OHLCV time series.
+    """
+    del timeframe, candles
+    return request_option_chain(symbol, require_realtime=require_realtime)
 
     # ==================================================
 # SOURCE HEALTH CHECK
@@ -1085,4 +1137,3 @@ if __name__ == "__main__":
 
     print("\nSource Engine Ready.")
 
-    

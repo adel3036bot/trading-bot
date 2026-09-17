@@ -52,6 +52,7 @@ class EventType(str, Enum):
 
     # الحدث الجديد المستخدم عند إرسال إشارة جديدة
     NEW_TRADE = "NEW_TRADE"
+    TRADE_CLOSED = "TRADE_CLOSED"
 
     # يمكن إضافة أنواع جديدة مستقبلًا هنا:
     # APP_NOTIFICATION = "APP_NOTIFICATION"

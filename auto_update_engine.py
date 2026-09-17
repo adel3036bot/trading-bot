@@ -3,10 +3,24 @@
 # ==================================================
 
 import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from trade_manager import update_trade
 from core.events import TradeEvent, EventType
+from core.signal_schema import DataQuality, InstrumentType
+
+
+@dataclass(frozen=True, slots=True)
+class PriceUpdate:
+    """A ready, instrument-specific price observation for lifecycle tracking."""
+
+    symbol: str
+    instrument_type: InstrumentType
+    price: float | None
+    source_timestamp: datetime
+    data_quality: DataQuality = DataQuality.VERIFIED
 
 
 class AutoUpdateEngine:
@@ -21,8 +35,30 @@ class AutoUpdateEngine:
     لا يعرف أي قناة
     """
 
-    def __init__(self):
-        pass
+    def __init__(self, *, max_price_age: timedelta = timedelta(minutes=2)):
+        self.max_price_age = max_price_age
+
+    def _reliable_price(self, trade: dict[str, Any], update: PriceUpdate) -> bool:
+        if update.data_quality is not DataQuality.VERIFIED or update.price is None or update.price <= 0:
+            return False
+        if update.source_timestamp.tzinfo is None:
+            return False
+        age = datetime.now(timezone.utc) - update.source_timestamp.astimezone(timezone.utc)
+        if age < timedelta(minutes=-1) or age > self.max_price_age:
+            return False
+
+        expected_instrument = trade.get("instrument_type")
+        if expected_instrument is None:
+            expected_instrument = InstrumentType.OPTION if trade.get("contract_symbol") else InstrumentType.EQUITY
+        try:
+            if InstrumentType(str(expected_instrument).upper()) is not update.instrument_type:
+                return False
+        except ValueError:
+            return False
+
+        # An option lifecycle must use the contract price, never its underlying.
+        expected_symbol = trade.get("contract_symbol") if update.instrument_type is InstrumentType.OPTION else trade.get("symbol")
+        return bool(expected_symbol and str(expected_symbol).upper() == update.symbol.upper())
 
     # ==================================================
     # CHECK TRADE → RETURNS (UPDATED_TRADE, EVENTS)
@@ -31,15 +67,18 @@ class AutoUpdateEngine:
     def check_trade(
         self,
         trade: dict[str, Any],
-        current_price: float
+        price_update: PriceUpdate
     ) -> tuple[dict[str, Any], list[TradeEvent]]:
 
         events: list[TradeEvent] = []
 
+        if not self._reliable_price(trade, price_update):
+            return trade, events
+
         old_stage = trade["stage"]
 
         # تحديث حالة الصفقة
-        trade = update_trade(trade, current_price)
+        trade = update_trade(trade, float(price_update.price))
 
         new_stage = trade["stage"]
 
@@ -65,36 +104,6 @@ class AutoUpdateEngine:
                         EventType.OPEN_PROFIT,
                         trade,
                         {"profit": trade["profit"], "stage": trade["stage"]}
-                    )
-                )
-
-            # MOONSHOT
-            if should_send_moonshot_update(trade):
-                events.append(
-                    TradeEvent.create(
-                        EventType.MOONSHOT,
-                        trade,
-                        {"profit": trade["profit"]}
-                    )
-                )
-
-            # LEGENDARY
-            if should_send_legendary_update(trade):
-                events.append(
-                    TradeEvent.create(
-                        EventType.LEGENDARY,
-                        trade,
-                        {"profit": trade["profit"]}
-                    )
-                )
-
-            # GOD MODE
-            if should_send_god_mode_update(trade):
-                events.append(
-                    TradeEvent.create(
-                        EventType.GOD_MODE,
-                        trade,
-                        {"profit": trade["profit"]}
                     )
                 )
 
@@ -195,37 +204,6 @@ class AutoUpdateEngine:
                 )
             )
 
-        # ==================================================
-        # أحداث إضافية مبنية على الربح (حتى مع تغيير المرحلة)
-        # ==================================================
-
-        if should_send_moonshot_update(trade):
-            events.append(
-                TradeEvent.create(
-                    EventType.MOONSHOT,
-                    trade,
-                    {"profit": trade["profit"]}
-                )
-            )
-
-        if should_send_legendary_update(trade):
-            events.append(
-                TradeEvent.create(
-                    EventType.LEGENDARY,
-                    trade,
-                    {"profit": trade["profit"]}
-                )
-            )
-
-        if should_send_god_mode_update(trade):
-            events.append(
-                TradeEvent.create(
-                    EventType.GOD_MODE,
-                    trade,
-                    {"profit": trade["profit"]}
-                )
-            )
-
         if should_send_open_profit_update(trade):
             events.append(
                 TradeEvent.create(
@@ -246,13 +224,13 @@ def should_send_progress_message(trade):
     profit = trade["profit"]
     stage = trade["stage"]
 
-    if stage == 0:
-        return profit >= 20
-
-    if stage >= 1:
-        return True
-
-    return False
+    eligible = (stage == 0 and profit >= 20) or stage >= 1
+    if not eligible or stage < 0:
+        return False
+    if trade.get("last_progress_stage") == stage:
+        return False
+    trade["last_progress_stage"] = stage
+    return True
 
 
 # ==================================================
@@ -304,6 +282,7 @@ def should_send_disclaimer_message():
 
 def close_trade(trade):
     trade["is_closed"] = True
+    trade["status"] = "CLOSED"
     return trade
 
 

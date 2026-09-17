@@ -18,6 +18,7 @@ from datetime import (
 import random
 import time
 import threading
+import logging
 import pandas as pd
 
 # ==================================================
@@ -51,6 +52,7 @@ from trade_manager import update_trade
 # ==================================================
 
 from daily_scheduler import DailyScheduler
+from core.trade_lifecycle import TradeLifecycle
 
 # ==================================================
 # TELEGRAM ENGINE
@@ -105,7 +107,7 @@ def get_trend(symbol):
         if data is not None and len(data) >= 2:
             return "CALL 📈" if data["Close"].iloc[-1] > data["Close"].iloc[0] else "PUT 📉"
     except: pass
-    return random.choice(["CALL 📈", "PUT 📉"])
+    return None
 
 # ==================================================
 # OPTION FUNCTIONS
@@ -128,7 +130,10 @@ def get_best_option(symbol, signal_type):
         chain = get_option_chain_data(symbol)
         if stock_data is None or chain is None: return None
         
-        expiry = get_option_expiry(symbol)
+        # The chain already carries its real contract expiries.  Do not make a
+        # second request or synthesize an expiry when the snapshot has none.
+        expiries = chain.get("expiries") or []
+        expiry = expiries[0] if expiries else None
         if not expiry: return None
 
         current_price = float(stock_data["Close"].iloc[-1])
@@ -317,6 +322,10 @@ def final_approval(
 def create_trade(symbol):
 
     signal_type = get_trend(symbol)
+
+    # A failed or incomplete data request must never manufacture a direction.
+    if not signal_type:
+        return None
 
     score_data = get_signal_score(symbol)
 
@@ -1636,7 +1645,7 @@ def get_trend(symbol):
             return "CALL 📈" if data["Close"].iloc[-1] > data["Close"].iloc[0] else "PUT 📉"
     except:
         pass
-    return random.choice(["CALL 📈", "PUT 📉"])
+    return None
 
 
 # ==================================================
@@ -1663,7 +1672,10 @@ def get_best_option(symbol, signal_type):
         if stock_data is None or chain is None:
             return None
 
-        expiry = get_option_expiry(symbol)
+        # Use the same verified snapshot used for selection.  A second request
+        # can be delayed, inconsistent, or unavailable.
+        expiries = chain.get("expiries") or []
+        expiry = expiries[0] if expiries else None
         if not expiry:
             return None
 
@@ -1701,9 +1713,9 @@ def get_best_option(symbol, signal_type):
             "open_interest": int(best["openInterest"]),
             "volume": int(best["volume"]),
             "distance": round(float(best["distance"]), 2),
-            "bid": float(best.get("bid", best["lastPrice"])),
-            "ask": float(best.get("ask", best["lastPrice"])),
-            "delta": float(best.get("delta", 0.0))
+            "bid": float(best["bid"]) if pd.notna(best.get("bid")) else None,
+            "ask": float(best["ask"]) if pd.notna(best.get("ask")) else None,
+            "delta": float(best["delta"]) if pd.notna(best.get("delta")) else None
         }
     except Exception as e:
         print("OPTION ERROR:", e)
@@ -2088,10 +2100,13 @@ def scan_watchlist(session: str, news_engine: NewsEngine):
     market = get_cached_market()
 
     for symbol in all_symbols:
+        # One symbol must not block the remainder of the watchlist, News, or
+        # Scheduler work in the current process cycle.
+        try:
+            trade = create_trade(symbol)
 
-        trade = create_trade(symbol)
-
-        if trade:
+            if not trade:
+                continue
 
             trade = update_trade(
                 trade,
@@ -2102,6 +2117,8 @@ def scan_watchlist(session: str, news_engine: NewsEngine):
                 continue
 
             signals.append(trade)
+        except Exception as error:
+            print(f"⚠️ SCAN FAILED | {symbol} | {error}")
 
     signals = sorted(
         signals,
@@ -2112,13 +2129,20 @@ def scan_watchlist(session: str, news_engine: NewsEngine):
     return signals[:5]
 
 
-def show_top_signals(session: str, news_engine: NewsEngine):
+def show_top_signals(session: str, news_engine: NewsEngine, telegram: TelegramEngine | None = None, lifecycle: TradeLifecycle | None = None):
 
     global sent_signals
 
-    telegram = TelegramEngine()
+    # The application injects one reusable engine.  The fallback preserves
+    # compatibility for direct/manual calls outside the application loop.
+    telegram = telegram or TelegramEngine()
+    lifecycle = lifecycle or TradeLifecycle(telegram.journal)
 
-    signals = scan_watchlist(session, news_engine)
+    try:
+        signals = scan_watchlist(session, news_engine)
+    except Exception as error:
+        print(f"⚠️ WATCHLIST SCAN FAILED | {error}")
+        return
 
     for signal in signals:
 
@@ -2134,10 +2158,15 @@ def show_top_signals(session: str, news_engine: NewsEngine):
         )
 
         if signal_id not in sent_signals:
-
-            telegram.send_signal(signal, extra_text=explain)
-
-            sent_signals.add(signal_id)
+            try:
+                # Persist the active trade before any delivery.  A Telegram
+                # failure is recorded separately, but a failed base journal
+                # means there is no trade for AutoUpdate to follow.
+                persisted_trade = lifecycle.start_trade(signal)
+                telegram.send_signal(persisted_trade, extra_text=explain)
+                sent_signals.add(signal_id)
+            except Exception as error:
+                print(f"⚠️ TELEGRAM SIGNAL FAILED | {signal.get('symbol', '')} | {error}")
 
         else:
 
@@ -2156,10 +2185,25 @@ if __name__ == "__main__":
 
     print("🚀 ADEL SMART BOT STARTED")
 
-    scheduler = DailyScheduler()
     telegram = TelegramEngine()
-
     news_engine = NewsEngine()
+    scheduler = DailyScheduler(telegram=telegram, news_engine=news_engine)
+
+    def send_legacy_news(items):
+        """Compatibility path: preserve text-only delivery while journaling it."""
+        destination = telegram.news_destination() if hasattr(telegram, "news_destination") else None
+        for item in items or []:
+            raw = item.get("raw") if isinstance(item, dict) else None
+            text = item.get("message", "") if isinstance(item, dict) else ""
+            try:
+                success = telegram.send_message(text, destination=destination)
+            except Exception as error:
+                success = False
+                logging.error("Legacy news delivery failed: %s", error)
+            if success:
+                news_engine.mark_as_sent(raw, destination=destination or "DEFAULT")
+            else:
+                news_engine.record_delivery_failure(raw, destination=destination or "DEFAULT")
 
     # ==================================================
     # TELEGRAM USER INTERFACE
@@ -2194,31 +2238,25 @@ if __name__ == "__main__":
 
                 print("📈 MARKET OPEN MODE")
 
-                show_top_signals("MARKET_OPEN", news_engine)
+                show_top_signals("MARKET_OPEN", news_engine, telegram)
 
-                breaking_news = news_engine.breaking_news()
-                for news in breaking_news:
-                    telegram.send_message(news["message"])
+                send_legacy_news(news_engine.breaking_news())
 
             elif status == "PRE_MARKET":
 
                 print("🌅 PRE MARKET MODE")
 
-                show_top_signals("PRE_MARKET", news_engine)
+                show_top_signals("PRE_MARKET", news_engine, telegram)
 
-                pre_market_news = news_engine.morning_news()
-                for news in pre_market_news:
-                    telegram.send_message(news["message"])
+                send_legacy_news(news_engine.morning_news())
 
             elif status == "AFTER_MARKET":
 
                 print("📊 AFTER MARKET MODE")
 
-                show_top_signals("AFTER_MARKET", news_engine)
+                show_top_signals("AFTER_MARKET", news_engine, telegram)
 
-                after_market_news = news_engine.after_market_news()
-                for news in after_market_news:
-                    telegram.send_message(news["message"])
+                send_legacy_news(news_engine.after_market_news())
 
             else:
 
@@ -2234,4 +2272,3 @@ if __name__ == "__main__":
 
             
 
-            
