@@ -3,6 +3,8 @@
 # Interface Formatter (LOCKED — Final Version)
 # ==========================================================
 
+from html import escape
+
 class InterfaceFormatter:
     """
     مسؤول عن:
@@ -249,7 +251,7 @@ class InterfaceFormatter:
 
 ━━━━━━━━━━━━━━━━━━
 
-{self.channel_url}
+<a href="{escape(self.channel_url, quote=True)}">📢 ADEL Smart Signals</a>
 """
 
     # ==========================================================
@@ -348,6 +350,28 @@ class InterfaceFormatter:
             "يمكنك اختيار عنصر آخر من نفس القائمة."
         )
 
+    def build_service_state_message(self, state: str) -> str:
+        """Small, honest user-facing states for services without a backend."""
+        states = {
+            "WAITING_FOR_DATA_PROVIDER": (
+                "⏳ هذه الخدمة قيد التجهيز حاليًا.\n\n"
+                "سيتم تفعيلها بعد اكتمال ربط البيانات المباشرة."
+            ),
+            "TEMPORARILY_UNAVAILABLE": "⚠️ الخدمة غير متاحة مؤقتًا.\n\nيرجى المحاولة لاحقًا.",
+            "COMING_SOON": "🚧 هذه الميزة قيد التجهيز حاليًا.",
+            "SUBSCRIPTION_REQUIRED": "🔒 هذه الخدمة متاحة للمشتركين.\n\nيمكنك فتح صفحة الاشتراك لطلب الانضمام.",
+            "EXPIRED_SUBSCRIPTION": "⏳ انتهى اشتراكك.\n\nيمكنك تقديم طلب تجديد من صفحة الاشتراك.",
+            "NO_RESULTS": "ℹ️ لا توجد نتائج موثوقة متاحة حاليًا.",
+            "ADMIN_REQUIRED": "⛔ هذه الخدمة مخصصة للإدارة.",
+        }
+        return states.get(state, self.build_under_development_message())
+
+    def build_subscription_request_created_message(self) -> str:
+        return "✅ تم تسجيل طلب الاشتراك بنجاح.\n\nسيتم مراجعته وإشعارك عند تحديث حالته."
+
+    def build_subscription_request_pending_message(self) -> str:
+        return "⏳ لديك طلب اشتراك قيد المراجعة بالفعل."
+
     # ==========================================================
     # SUBSCRIPTIONS — USER SIDE (NEW PHILOSOPHY)
     # ==========================================================
@@ -419,6 +443,21 @@ class InterfaceFormatter:
 
 سيتم إضافة هذه الميزة قريبًا.
 """
+
+    def build_subscription_invite_unavailable_message(self) -> str:
+        return """🔗 رابط الدعوة غير متاح حاليًا
+
+━━━━━━━━━━━━━━━━━━
+
+لم يتم تفعيل وجهة اشتراك خاصة بصلاحية إنشاء روابط دعوة آمنة بعد.
+سيظهر الرابط هنا تلقائيًا بعد تفعيلها.
+"""
+
+    def build_subscription_request_action_message(self, action: str, request_id: int, success: bool) -> str:
+        if success:
+            verb = "قبول" if action == "approve" else "رفض"
+            return f"✅ تم {verb} طلب الاشتراك رقم {request_id} وتسجيل العملية."
+        return f"⚠️ الطلب رقم {request_id} لم يعد معلقًا أو غير موجود."
 
     def build_subscription_store_message(self) -> str:
         return """🛒 متجر سلة

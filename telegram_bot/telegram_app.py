@@ -55,7 +55,32 @@ class TelegramApp:
         # تمرير قاعدة البيانات إلى واجهة البوت
         self.interface = BotInterface(
             channel_url=self.channel_url,
-            db=self.db
+            db=self.db,
+            owner_tg_id=self.admin_id,
+        )
+
+    @staticmethod
+    def _is_greeting(text: str) -> bool:
+        return (text or "").strip().casefold() in {"مرحبا", "السلام عليكم", "hi"}
+
+    async def _open_home(self, update: Update, *, include_welcome: bool) -> None:
+        """Private-chat home entry point shared by /start and greetings."""
+        user = update.effective_user
+        if update.message is None or user is None:
+            return
+        self.db.add_user(user.id, user.first_name, user.username)
+        self.db.update_user_activity(user.id)
+        page = self.interface.open_main_page(first_name=user.first_name or "Trader", user_id=user.id)
+        keyboard = ReplyKeyboardMarkup(page["keyboard"], resize_keyboard=True)
+        if include_welcome:
+            await update.message.reply_text(
+                text=page["welcome_message"],
+                disable_web_page_preview=True,
+            )
+        await update.message.reply_text(
+            text=page["home_message"],
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
         )
 
     # ==========================================================
@@ -79,67 +104,7 @@ class TelegramApp:
         if chat is None or chat.type != "private":
             return
 
-        user = update.effective_user
-
-        if user is None:
-            return
-
-        # ==========================================================
-        # USER REGISTRATION
-        # ==========================================================
-
-        self.db.add_user(
-            user.id,
-            user.first_name,
-            user.username
-        )
-
-        self.db.update_user_activity(
-            user.id
-        )
-
-        # ==========================================================
-        # BUILD HOME PAGE
-        # ==========================================================
-
-        page = self.interface.open_main_page(
-            first_name=user.first_name or "Trader",
-            user_id=user.id
-        )
-
-        keyboard = ReplyKeyboardMarkup(
-            page["keyboard"],
-            resize_keyboard=True
-        )
-
-        # ==========================================================
-        # SEND WELCOME MESSAGE
-        # ==========================================================
-
-        await update.message.reply_text(
-            text=page["welcome_message"],
-            disable_web_page_preview=True
-        )
-
-        # ==========================================================
-        # SEND HOME PAGE
-        # ==========================================================
-
-        await update.message.reply_text(
-            text=page["home_message"],
-            reply_markup=keyboard,
-            disable_web_page_preview=True
-        )
-
-        # ==========================================================
-        # SEND SMART CARD (IF AVAILABLE)
-        # ==========================================================
-
-        if page["smart_card"]:
-            await update.message.reply_text(
-                text=page["smart_card"],
-                disable_web_page_preview=True
-            )
+        await self._open_home(update, include_welcome=True)
 
     # ==========================================================
     # BUTTON HANDLER
@@ -167,6 +132,13 @@ class TelegramApp:
         if user is None:
             return
 
+        if self._is_greeting(update.message.text):
+            await self._open_home(update, include_welcome=True)
+            return
+
+        self.db.add_user(user.id, user.first_name, user.username)
+        self.db.update_user_activity(user.id)
+
         response = self.interface.handle_button(
             button_text=update.message.text,
             first_name=user.first_name or "Trader",
@@ -181,7 +153,8 @@ class TelegramApp:
         await update.message.reply_text(
             text=response["message"],
             reply_markup=keyboard,
-            disable_web_page_preview=True
+            disable_web_page_preview=True,
+            parse_mode=response.get("parse_mode"),
         )
 
     # ==========================================================

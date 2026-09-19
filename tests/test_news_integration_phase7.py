@@ -11,6 +11,7 @@ from database.database import DatabaseManager
 from daily_scheduler import DailyScheduler
 from images.image_engine import ImageEngine
 from news.news_engine import NewsEngine
+from news.news_editor import NewsEditor
 from PIL import Image
 
 
@@ -35,7 +36,7 @@ class _Editor:
 
 class _FailingEditor:
     def clean_and_translate(self, news):
-        return {**news, "translated": news["summary"], "translation_status": "FAILED", "translation_error": "provider_error"}
+        return {**news, "translated": news["summary"], "translation_status": "FAILED", "translation_error": "TRANSLATION_RATE_LIMIT"}
 
 
 class _Telegram:
@@ -106,7 +107,125 @@ class NewsIntegrationPhase7Tests(TestCase):
         conn = self.journal.connect()
         row = conn.execute("SELECT status FROM news_journal").fetchone()
         conn.close()
-        self.assertEqual(row[0], "FAILED_TRANSLATION")
+        self.assertEqual(row[0], "TRANSLATION_RATE_LIMIT")
+
+    def test_premarket_selects_top_three_before_translation(self):
+        translated = []
+
+        class CountingEditor(_Editor):
+            def clean_and_translate(self, news):
+                translated.append(news["url"])
+                return super().clean_and_translate(news)
+
+        items = [
+            {**self.news, "url": f"https://example.test/{index}", "title": f"CPI NVDA {index}", "summary": f"CPI NVDA {index}", "category": "MACRO"}
+            for index in range(5)
+        ]
+        result = self.engine(items, editor=CountingEditor()).morning_news_structured()
+        self.assertEqual(len(result), 3)
+        self.assertEqual(len(translated), 3)
+
+    def test_validated_translation_is_reused_after_restart(self):
+        calls = []
+
+        class CountingEditor(_Editor):
+            def clean_and_translate(self, news):
+                calls.append(news["url"])
+                return super().clean_and_translate(news)
+
+        first = self.engine(editor=CountingEditor()).morning_news_structured()[0]
+        second = self.engine(editor=CountingEditor()).morning_news_structured()[0]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(first["text"], second["text"])
+
+    def test_translation_error_categories_are_not_collapsed(self):
+        class _QuotaError(Exception):
+            code = 429
+            message = "quota exhausted; check billing"
+
+        class _DailyError(Exception):
+            code = 429
+            message = "requests per day quota exceeded"
+
+        class _ServerError(Exception):
+            code = 503
+            message = "backend unavailable"
+
+        self.assertEqual(NewsEditor.classify_translation_error(_QuotaError()), "TRANSLATION_QUOTA_EXHAUSTED")
+        self.assertEqual(NewsEditor.classify_translation_error(_DailyError()), "TRANSLATION_DAILY_QUOTA")
+        self.assertEqual(NewsEditor.classify_translation_error(_ServerError()), "TRANSLATION_SERVER_ERROR")
+
+    def test_title_quota_failure_does_not_spend_a_summary_request(self):
+        class _QuotaError(Exception):
+            code = 429
+            message = "quota exhausted; check billing"
+
+        class _Models:
+            def __init__(self):
+                self.calls = 0
+
+            def generate_content(self, **_kwargs):
+                self.calls += 1
+                raise _QuotaError()
+
+        class _Client:
+            def __init__(self):
+                self.models = _Models()
+
+        editor = NewsEditor.__new__(NewsEditor)
+        editor.max_title_length = 120
+        editor.max_summary_length = 280
+        editor.remove_words = []
+        editor.client = _Client()
+        editor.model_name = "test-model"
+        result = editor.clean_and_translate(self.news)
+        self.assertEqual(editor.client.models.calls, 1)
+        self.assertEqual(result["translation_status"], "FAILED")
+        self.assertEqual(result["translation_error"], "TRANSLATION_QUOTA_EXHAUSTED")
+
+    def test_translation_validation_accepts_equivalent_arabic_currency_notation(self):
+        """$5 and 5 دولار are the same protected financial value.
+
+        Tickers still have to remain literal: this is normalization, not a
+        relaxation of the validation boundary.
+        """
+        original = "NVDA rises from $5 to $7, up 2.4% on SPX"
+        arabic = "ارتفع NVDA من 5 دولار إلى 7 دولار، بنسبة 2.4% على SPX"
+        self.assertEqual(
+            NewsEditor.protected_tokens(original) - NewsEditor.protected_tokens(arabic),
+            set(),
+        )
+        missing_ticker = NewsEditor.protected_tokens(original) - NewsEditor.protected_tokens(
+            "ارتفع من 5 دولار إلى 7 دولار، بنسبة 2.4% على SPX"
+        )
+        self.assertIn("symbol:NVDA", missing_ticker)
+
+    def test_validation_rejection_exposes_exact_missing_symbol_for_journal_diagnostics(self):
+        class _Response:
+            text = "ارتفع سهم SPX بنسبة 2.4% إلى 5 دولار"
+
+        class _Models:
+            def generate_content(self, **_kwargs):
+                return _Response()
+
+        class _Client:
+            models = _Models()
+
+        editor = NewsEditor.__new__(NewsEditor)
+        editor.max_title_length = 120
+        editor.max_summary_length = 280
+        editor.remove_words = []
+        editor.client = _Client()
+        editor.model_name = "test-model"
+        result = editor.clean_and_translate({**self.news, "title": "NVDA SPX rises to $5, up 2.4%"})
+        self.assertEqual(result["translation_error"], "TRANSLATION_VALIDATION_REJECTED")
+        self.assertEqual(result["translation_validation_missing"], {"title": ["symbol:NVDA"]})
+
+    def test_marketwatch_source_is_preserved_as_an_html_original_link(self):
+        item = self.engine([
+            {**self.news, "source": "MarketWatch", "url": "https://example.test/marketwatch"}
+        ]).morning_news_structured()[0]
+        self.assertIn('<a href="https://example.test/marketwatch">MarketWatch</a>', item["text"])
 
     def test_image_failure_falls_back_to_ready_text_and_records_delivery(self):
         engine = self.engine()

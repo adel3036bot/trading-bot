@@ -2,7 +2,9 @@
 # IMPORTS
 # ==================================================
 
+import logging
 import re
+import unicodedata
 from html import unescape
 from google import genai
 from config import GEMINI_API_KEY
@@ -21,6 +23,7 @@ class NewsEditor:
 
         self.max_title_length = 120
         self.max_summary_length = 280
+        self.last_validation_missing = {}
 
         # ==================
         # COMMON WORDS
@@ -39,13 +42,16 @@ class NewsEditor:
         # GEMINI CLIENT
         # ==================
 
-        self.client = genai.Client(api_key=GEMINI_API_KEY)
+        # A single news translation can legitimately take longer than the
+        # SDK's short default network timeout.  This does not add retries or
+        # change quota behavior.
+        self.client = genai.Client(api_key=GEMINI_API_KEY, http_options={"timeout": 60_000})
 
         # ==================
         # MODEL SETTINGS
         # ==================
 
-        self.model_name = "gemini-flash-latest"
+        self.model_name = "gemini-3.1-flash-lite"
 
     # ==================================================
     # TRANSLATION PROMPT ENGINE
@@ -96,7 +102,57 @@ Headline:
 
     @staticmethod
     def protected_tokens(text):
-        return set(re.findall(r"\$?\d[\d,]*(?:\.\d+)?%?|\b[A-Z]{1,5}\b", text or ""))
+        """Return semantic tokens that must survive a translation.
+
+        The former raw-string comparison incorrectly rejected equivalent
+        Arabic financial notation, e.g. ``$5`` versus ``5 دولار``.  Symbols
+        remain strict and numbers retain their financial meaning (plain,
+        currency, or percentage); only Unicode/directional representation is
+        normalized.
+        """
+        normalized = unicodedata.normalize("NFKC", str(text or "")).translate(
+            str.maketrans("٠١٢٣٤٥٦٧٨٩٫٬٪", "0123456789.,%")
+        )
+        tokens = {
+            f"symbol:{symbol}"
+            for symbol in re.findall(r"\b[A-Z]{2,5}\b", normalized)
+        }
+
+        for match in re.finditer(r"\$?\d[\d,]*(?:\.\d+)?%?", normalized):
+            raw = match.group(0)
+            number = raw.replace("$", "").replace(",", "")
+            context = normalized[max(0, match.start() - 12):match.end() + 24]
+            if raw.endswith("%"):
+                kind = "percent"
+            elif raw.startswith("$") or re.search(
+                r"(?:\b(?:USD|US\$)\b|دولار(?:ات|ًا|اً)?|أمريكي(?:ة)?)",
+                context,
+                flags=re.IGNORECASE,
+            ):
+                kind = "currency"
+            else:
+                kind = "number"
+            tokens.add(f"{kind}:{number}")
+        return tokens
+
+    @staticmethod
+    def classify_translation_error(error):
+        """Map provider failures to safe, actionable journal statuses.
+
+        The provider response is intentionally not logged: it can contain
+        request context and is not needed for retries or reporting.
+        """
+        code = getattr(error, "code", None) or getattr(error, "status_code", None)
+        message = str(getattr(error, "message", "") or error).lower()
+        if str(code) == "429" or "resource_exhausted" in message:
+            if any(marker in message for marker in ("per day", "daily", "requests per day", "rpd")):
+                return "TRANSLATION_DAILY_QUOTA"
+            if "quota" in message or "billing" in message:
+                return "TRANSLATION_QUOTA_EXHAUSTED"
+            return "TRANSLATION_RATE_LIMIT"
+        if str(code).startswith("5"):
+            return "TRANSLATION_SERVER_ERROR"
+        return "TRANSLATION_API_FAILED"
 
     def translate_title(self, title):
         title = self.clean_title(title)
@@ -109,14 +165,16 @@ Headline:
             )
             translated = self.format_translation(getattr(response, "text", ""))
             if not translated:
-                return title, "empty_title_translation"
+                return title, "TRANSLATION_RESPONSE_INVALID"
             missing = self.protected_tokens(title) - self.protected_tokens(translated)
             if missing:
-                return title, "missing_protected_title_tokens"
+                self.last_validation_missing = {"title": sorted(missing)}
+                return title, "TRANSLATION_VALIDATION_REJECTED"
             return translated, None
         except Exception as error:
-            print("TITLE TRANSLATION ERROR", error)
-            return title, type(error).__name__
+            status = self.classify_translation_error(error)
+            logging.warning("Gemini title translation failed with status=%s", status)
+            return title, status
 
     # ==================================================
     # GEMINI TRANSLATION ENGINE
@@ -139,18 +197,14 @@ Headline:
             translated_text = self.format_translation(getattr(response, "text", ""))
 
             if not translated_text or translated_text.strip() == "":
-                self.last_translation_error = "empty_translation"
+                self.last_translation_error = "TRANSLATION_RESPONSE_INVALID"
                 return summary
 
             return translated_text
 
         except Exception as error:
-            self.last_translation_error = type(error).__name__
-            print("\n===================================")
-            print("GEMINI TRANSLATION ERROR")
-            print("===================================")
-            print(error)
-            print("===================================\n")
+            self.last_translation_error = self.classify_translation_error(error)
+            logging.warning("Gemini summary translation failed with status=%s", self.last_translation_error)
 
             return summary
 
@@ -239,12 +293,19 @@ Headline:
             return {}
 
         cleaned = self.clean_news(news)
+        self.last_validation_missing = {}
 
         title = cleaned.get("title", "")
         summary = cleaned.get("summary", "")
 
         translated_title, title_error = self.translate_title(title)
-        translated_summary = self.translate_news(title, summary)
+        # A failed headline request means the complete Arabic payload cannot
+        # be validated.  Do not spend a second Gemini request on its summary.
+        if title_error:
+            translated_summary = summary
+            self.last_translation_error = title_error
+        else:
+            translated_summary = self.translate_news(title, summary)
 
         # The existing editor is the only translation layer.  Keep the old
         # translated_summary key for compatibility and expose the canonical
@@ -252,7 +313,8 @@ Headline:
         translation_error = title_error or getattr(self, "last_translation_error", None)
         missing_summary_tokens = self.protected_tokens(summary) - self.protected_tokens(translated_summary)
         if missing_summary_tokens:
-            translation_error = "missing_protected_summary_tokens"
+            translation_error = "TRANSLATION_VALIDATION_REJECTED"
+            self.last_validation_missing["summary"] = sorted(missing_summary_tokens)
 
         edited_news = cleaned.copy()
         edited_news["original_title"] = title
@@ -261,5 +323,6 @@ Headline:
         edited_news["translated"] = translated_summary
         edited_news["translation_status"] = "FAILED" if translation_error else "TRANSLATED"
         edited_news["translation_error"] = translation_error
+        edited_news["translation_validation_missing"] = dict(self.last_validation_missing)
 
         return edited_news

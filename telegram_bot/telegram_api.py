@@ -39,7 +39,7 @@ class TelegramAPI:
     # ======================================================
     # SEND TEXT MESSAGE (SAFE & SYNC-FRIENDLY)
     # ======================================================
-    def send_message(self, text: str, *, destination=None) -> bool:
+    def send_message(self, text: str, *, destination=None, parse_mode=None) -> bool:
         """
         إرسال رسالة نصية للقناة.
         يعمل مع python-telegram-bot 22.7 بدون مشاكل.
@@ -54,7 +54,8 @@ class TelegramAPI:
                 self.bot.send_message(
                     chat_id=destination if destination is not None else self.channel_id,
                     text=text,
-                    disable_web_page_preview=True
+                    disable_web_page_preview=True,
+                    parse_mode=parse_mode,
                 ),
                 self.loop
             )

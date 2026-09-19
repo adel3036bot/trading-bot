@@ -8,6 +8,7 @@ import sqlite3
 import hashlib
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from core.signal_schema import AssetClass, Direction, InstrumentType, Signal, build_signal_id
@@ -23,8 +24,13 @@ class DatabaseManager:
     - إضافة فهارس لتحسين الأداء
     """
 
-    def __init__(self, db_path="adel_smart_bot.db"):
-        self.db_path = db_path
+    def __init__(self, db_path=None):
+        # Resolve the production journal once from this module, rather than
+        # from whichever working directory launched a scheduler/test process.
+        # Explicit test or deployment paths remain supported unchanged.
+        self.db_path = str(
+            Path(db_path) if db_path is not None else Path(__file__).resolve().parents[1] / "adel_smart_bot.db"
+        )
         self._init_database()
 
     # ==========================================================
@@ -252,6 +258,14 @@ class DatabaseManager:
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_news_journal_status ON news_journal(status, source_timestamp);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_news_deliveries_news_id ON news_deliveries(news_id, attempted_at);")
+        # Translation is persisted separately from delivery status.  A news
+        # record may become SENT after a successful translation, so status
+        # alone cannot safely serve as the translation cache key.
+        self._ensure_columns(cur, "news_journal", {
+            "translated_title": "TEXT",
+            "translated_summary": "TEXT",
+            "translation_metadata_json": "TEXT",
+        })
         cur.execute("""CREATE TABLE IF NOT EXISTS report_journal (
             report_key TEXT PRIMARY KEY, report_type TEXT NOT NULL, period_start TEXT NOT NULL,
             period_end TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, metadata_json TEXT)""")
@@ -607,6 +621,45 @@ class DatabaseManager:
         try:
             cur = conn.execute("UPDATE news_journal SET status = ?, metadata_json = ?, updated_at = ? WHERE news_id = ?",
                                (str(status), self._json(metadata or {}), self.now().isoformat(), news_id))
+            if cur.rowcount != 1:
+                raise ValueError("news_journal_not_found")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_news_translation(self, news_id: str):
+        """Return a previously validated Arabic translation, if one exists."""
+        conn = self.connect()
+        try:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("""
+                SELECT translated_title, translated_summary, translation_metadata_json
+                FROM news_journal WHERE news_id = ?
+            """, (news_id,)).fetchone()
+            if not row or not row["translated_title"] or not row["translated_summary"]:
+                return None
+            metadata = json.loads(row["translation_metadata_json"] or "{}")
+            return {
+                "title": row["translated_title"],
+                "summary": row["translated_summary"],
+                "metadata": metadata if isinstance(metadata, dict) else {},
+            }
+        finally:
+            conn.close()
+
+    def record_news_translation(self, news_id: str, translated_title: str, translated_summary: str, *, metadata=None) -> None:
+        """Persist only a validated translation; never derive or alter it here."""
+        conn = self.connect()
+        try:
+            cur = conn.execute("""
+                UPDATE news_journal
+                SET translated_title = ?, translated_summary = ?,
+                    translation_metadata_json = ?, updated_at = ?
+                WHERE news_id = ?
+            """, (
+                str(translated_title), str(translated_summary),
+                self._json(metadata or {}), self.now().isoformat(), news_id,
+            ))
             if cur.rowcount != 1:
                 raise ValueError("news_journal_not_found")
             conn.commit()
@@ -1158,23 +1211,13 @@ class DatabaseManager:
             conn.close()
             return False
 
-        # تحديث حالة الطلب مبدئيًا إلى approved
-        cur.execute("""
-            UPDATE subscription_requests
-            SET status = 'approved'
-            WHERE id = ?
-        """, (request_id,))
-
-        # حساب مدة الاشتراك
-        duration = self.get_plan_duration(plan_id)
+        # Read plan data through the same transaction.  Calling the older
+        # helper here opens a second SQLite writer connection and can leave a
+        # valid approval pending under concurrent/admin use.
+        cur.execute("SELECT duration_days FROM plans WHERE id = ?", (plan_id,))
+        plan_row = cur.fetchone()
+        duration = plan_row[0] if plan_row else None
         if duration is None:
-            # باقة غير صالحة → إعادة حالة الطلب إلى pending
-            cur.execute("""
-                UPDATE subscription_requests
-                SET status = 'pending'
-                WHERE id = ?
-            """, (request_id,))
-            conn.commit()
             conn.close()
             return False
 
@@ -1182,30 +1225,77 @@ class DatabaseManager:
         start_date = self.now().strftime("%Y-%m-%d")
         end_date = (self.now() + timedelta(days=duration)).strftime("%Y-%m-%d")
 
-        # محاولة إنشاء الاشتراك عبر الدالة الرسمية
         try:
-            self.create_subscription(user_id, plan_id, start_date, end_date)
-        except Exception:
-            # فشل إنشاء الاشتراك → إعادة حالة الطلب إلى pending
+            # Conditional update prevents double approval from stale buttons.
             cur.execute("""
-                UPDATE subscription_requests
-                SET status = 'pending'
-                WHERE id = ?
+                UPDATE subscription_requests SET status = 'approved'
+                WHERE id = ? AND status = 'pending'
             """, (request_id,))
+            if cur.rowcount != 1:
+                conn.rollback()
+                conn.close()
+                return False
+
+            # Same subscription semantics as create_subscription(), kept in
+            # this transaction so request status and access cannot diverge.
+            cur.execute("""
+                UPDATE subscriptions SET status = 'expired'
+                WHERE user_id = ? AND status = 'active'
+            """, (user_id,))
+            cur.execute("""
+                INSERT INTO subscriptions (user_id, plan_id, start_date, end_date, status)
+                VALUES (?, ?, ?, ?, 'active')
+            """, (user_id, plan_id, start_date, end_date))
+            cur.execute("""
+                UPDATE users SET subscription_status = 'active' WHERE id = ?
+            """, (user_id,))
+
+            log_date = self.now().strftime("%Y-%m-%d %H:%M")
+            cur.execute("""
+                INSERT INTO subscription_logs (user_id, action, date, details)
+                VALUES (?, 'approve_request', ?, ?)
+            """, (user_id, log_date, f"تم قبول طلب الاشتراك رقم {request_id}"))
             conn.commit()
+            conn.close()
+            return True
+        except Exception:
+            conn.rollback()
             conn.close()
             return False
 
-        # تسجيل العملية فقط عند النجاح
-        log_date = self.now().strftime("%Y-%m-%d %H:%M")
-        cur.execute("""
-            INSERT INTO subscription_logs (user_id, action, date, details)
-            VALUES (?, 'approve_request', ?, ?)
-        """, (user_id, log_date, f"تم قبول طلب الاشتراك رقم {request_id}"))
+    def reject_request(self, request_id):
+        """Reject one pending manual request without changing subscriptions.
 
-        conn.commit()
-        conn.close()
-        return True
+        The conditional update is deliberate: a stale admin button cannot reject
+        a request that another administrator has already decided.
+        """
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT user_id, status FROM subscription_requests WHERE id = ?",
+                (request_id,),
+            ).fetchone()
+            if not row or row[1] != "pending":
+                return False
+
+            updated = conn.execute(
+                "UPDATE subscription_requests SET status = 'rejected' "
+                "WHERE id = ? AND status = 'pending'",
+                (request_id,),
+            )
+            if updated.rowcount != 1:
+                return False
+
+            log_date = self.now().strftime("%Y-%m-%d %H:%M")
+            conn.execute(
+                "INSERT INTO subscription_logs (user_id, action, date, details) "
+                "VALUES (?, 'reject_request', ?, ?)",
+                (row[0], log_date, f"تم رفض طلب الاشتراك رقم {request_id}"),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
 
     # ==========================================================
     # PHASE 5 — SUBSCRIPTION LOGS
@@ -1420,12 +1510,115 @@ class DatabaseManager:
         conn.close()
         return row
 
-    def get_user_role(self, tg_id):
+    def get_user_role(self, tg_id, *, owner_tg_id=None):
         """
         جلب دور المستخدم الحقيقي بناءً على Telegram ID.
         لأن TelegramApp يمرّر user.id وهو tg_id وليس user_id داخل قاعدة البيانات.
         """
-        return self.get_setting(f"user_role_{tg_id}", "user")
+        if owner_tg_id is not None and int(tg_id) == int(owner_tg_id):
+            return "owner"
+        role = self.get_setting(f"user_role_{tg_id}", "user")
+        return role if role in ("admin", "user") else "user"
+
+    def get_internal_user_id(self, tg_id):
+        """Resolve the Telegram identity used by the interface to users.id."""
+        conn = self.connect()
+        try:
+            row = conn.execute("SELECT id FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
+    def get_user_subscription_by_tg_id(self, tg_id):
+        """Return subscription state for a Telegram user without mixing ID domains."""
+        user_id = self.get_internal_user_id(tg_id)
+        if user_id is None:
+            return {"status": "none"}
+        # This performs the existing expiry transition when it is due before
+        # returning the user-facing state.
+        self.is_subscription_active(user_id)
+        return self.get_user_subscription(user_id)
+
+    def is_subscription_active_by_tg_id(self, tg_id):
+        user_id = self.get_internal_user_id(tg_id)
+        return bool(user_id is not None and self.is_subscription_active(user_id))
+
+    def create_subscription_request_by_tg_id(self, tg_id, plan_id):
+        """Create one pending manual request using existing subscription tables.
+
+        This intentionally does not initiate a payment or grant access.
+        """
+        user_id = self.get_internal_user_id(tg_id)
+        if user_id is None:
+            return {"created": False, "reason": "user_not_registered"}
+        if self.get_plan(plan_id) is None:
+            return {"created": False, "reason": "plan_not_found"}
+
+        conn = self.connect()
+        try:
+            pending = conn.execute(
+                "SELECT id FROM subscription_requests WHERE user_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if pending:
+                return {"created": False, "reason": "pending_exists", "request_id": pending[0]}
+
+            now = self.now().isoformat()
+            cur = conn.execute(
+                "INSERT INTO subscription_requests (user_id, plan_id, request_date, status) VALUES (?, ?, ?, 'pending')",
+                (user_id, plan_id, now),
+            )
+            conn.execute(
+                "INSERT INTO subscription_logs (user_id, action, date, details) VALUES (?, ?, ?, ?)",
+                (user_id, "subscription_request", now, f"طلب اشتراك رقم {cur.lastrowid}"),
+            )
+            conn.commit()
+            return {"created": True, "request_id": cur.lastrowid}
+        finally:
+            conn.close()
+
+    def get_subscription_request(self, request_id):
+        """Return request state for UI/tests without exposing payment data."""
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT id, user_id, plan_id, request_date, status "
+                "FROM subscription_requests WHERE id = ?",
+                (request_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "id": row[0],
+                "user_id": row[1],
+                "plan_id": row[2],
+                "request_date": row[3],
+                "status": row[4],
+            }
+        finally:
+            conn.close()
+
+    def get_completed_trade_summaries(self, limit=10):
+        """Read closed lifecycle records only; never infer a trade result."""
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT s.symbol, s.asset_class, s.direction, t.closed_at
+                FROM trade_journal t
+                JOIN signal_journal s ON s.signal_id = t.signal_id
+                WHERE t.status = 'CLOSED'
+                ORDER BY t.closed_at DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+            return [
+                {"symbol": row[0], "asset_class": row[1], "direction": row[2], "closed_at": row[3]}
+                for row in rows
+            ]
+        finally:
+            conn.close()
 
 
     # ==========================================================

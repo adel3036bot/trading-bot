@@ -157,19 +157,48 @@ class NewsEngine:
         return self.filter.filter_important_news(classified)
 
     def prepare_structured(self, news):
-
-        edited = self.editor.clean_and_translate(news)
+        news_id = self.generate_news_id(news)
+        cached = self.journal.get_news_translation(news_id)
+        if cached:
+            edited = {
+                **news,
+                "original_title": news.get("title", ""),
+                "title": cached["title"],
+                "translated_summary": cached["summary"],
+                "translated": cached["summary"],
+                "translation_status": "TRANSLATED",
+                "translation_error": None,
+            }
+        else:
+            edited = self.editor.clean_and_translate(news)
 
         if edited.get("translation_status") == "FAILED":
             try:
-                news_id = self.journal.record_news(news, status="FAILED_TRANSLATION")
-                self.journal.update_news_status(news_id, "FAILED_TRANSLATION", metadata={"reason": edited.get("translation_error")})
+                status = str(edited.get("translation_error") or "TRANSLATION_RESPONSE_INVALID")
+                if not status.startswith("TRANSLATION_"):
+                    status = "TRANSLATION_RESPONSE_INVALID"
+                news_id = self.journal.record_news(news, status=status)
+                self.journal.update_news_status(
+                    news_id,
+                    status,
+                    metadata={
+                        "reason": edited.get("translation_error"),
+                        "missing_tokens": edited.get("translation_validation_missing", {}),
+                    },
+                )
             except Exception as error:
                 logging.error("News translation journal failed: %s", error)
             return None
 
         try:
             self.journal.record_news(news, status="TRANSLATED", metadata={"priority": news.get("priority"), "breaking": news.get("breaking", False)})
+            if not cached:
+                self.journal.record_news_translation(
+                    news_id,
+                    edited.get("title", ""),
+                    edited.get("translated", ""),
+                    metadata={"validated": True, "model": getattr(self.editor, "model_name", None)},
+                )
         except Exception as error:
             logging.error("News journal write failed: %s", error)
 
@@ -227,7 +256,20 @@ class NewsEngine:
     # LEGACY MODES (STRUCTURED)
     # ==================================================
 
-    def run_internal_structured(self, session_mode):
+    def _rank_final_candidates(self, candidates, *, limit=None):
+        priority_map = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+        ranked = sorted(
+            candidates,
+            key=lambda n: (
+                int(n.get("score", 0) or 0),
+                priority_map.get(n.get("priority", "LOW"), 1),
+                str(n.get("published") or n.get("timestamp") or ""),
+            ),
+            reverse=True,
+        )
+        return ranked if limit is None else ranked[:limit]
+
+    def run_internal_structured(self, session_mode, *, max_items=None, breaking_only=False):
 
         raw = self.fetch_news()
         classified = self.classify_news(raw)
@@ -252,17 +294,15 @@ class NewsEngine:
                 except Exception as error:
                     logging.error("News timestamp journal failed: %s", error)
         unique = [n for n in filtered if not self.is_duplicate(n)]
+        if breaking_only:
+            unique = [n for n in unique if n.get("breaking")]
 
         if not unique:
             return []
 
-        priority_map = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
-
-        sorted_news = sorted(
-            unique,
-            key=lambda n: priority_map.get(n.get("priority", "LOW"), 1),
-            reverse=True
-        )
+        # Translation happens only after final ranking/selection.  This is the
+        # quota boundary for session-based delivery paths.
+        sorted_news = self._rank_final_candidates(unique, limit=max_items)
 
         structured_list = []
 
@@ -274,10 +314,10 @@ class NewsEngine:
         return structured_list
 
     def morning_news_structured(self):
-        return self.run_internal_structured("PRE_MARKET")
+        return self.run_internal_structured("PRE_MARKET", max_items=3)
 
     def breaking_news_structured(self):
-        return self.run_internal_structured("MARKET_OPEN")
+        return self.run_internal_structured("MARKET_OPEN", max_items=1, breaking_only=True)
 
     def after_market_structured(self):
         return self.run_internal_structured("AFTER_MARKET")

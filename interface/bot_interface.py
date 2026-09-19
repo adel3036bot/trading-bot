@@ -25,9 +25,6 @@ class BotInterface:
     الإصدار LOCKED ولا يُفتح لاحقًا إلا عند إضافة ميزة جديدة.
     """
 
-    # 🔥 هذا السطر الصحيح 100٪ — داخل الكلاس وليس خارجه
-    print("🔥 BotInterface LOADED FROM:", __file__)
-
     # ==========================================================
     # MENU NAME CONSTANTS
     # ==========================================================
@@ -77,14 +74,40 @@ class BotInterface:
     BTN_SUBS_RENEW = "🔄 تجديد الاشتراك"
     BTN_SUBS_RESEND_INVITE = "🔗 إعادة إرسال رابط الدعوة"
     BTN_SUBS_GO_TO_STORE = "🛒 الذهاب إلى متجر سلة"
+    BTN_SUBS_REQUEST_BIWEEKLY = "🗓️ طلب اشتراك أسبوعين"
+    BTN_SUBS_REQUEST_MONTHLY = "🗓️ طلب اشتراك شهري"
+    BTN_ADMIN_APPROVE_REQUEST_PREFIX = "✅ قبول الطلب رقم "
+    BTN_ADMIN_REJECT_REQUEST_PREFIX = "❌ رفض الطلب رقم "
+
+    BTN_INDICES = "📊 المؤشرات"
+    BTN_GOLD = "🥇 الذهب"
+    BTN_BITCOIN = "₿ البيتكوين"
+    BTN_CALENDAR = "📅 التقويم الاقتصادي"
+    BTN_COMPLETED_TRADES = "🏆 الصفقات المكتملة"
+    BTN_NEWS_PREMARKET = "🌅 ما قبل الافتتاح"
+    BTN_NEWS_BREAKING = "🚨 الأخبار العاجلة"
+    BTN_NEWS_AFTER_MARKET = "🌙 بعد الإغلاق"
+    BTN_DAILY_REPORT = "📅 التقرير اليومي"
+    BTN_WEEKLY_REPORT = "📈 التقرير الأسبوعي"
+    BTN_MONTHLY_REPORT = "📊 التقرير الشهري"
+    BTN_SPX = "📈 SPX"
+    BTN_SPY = "📊 SPY"
+    BTN_NASDAQ = "💻 NASDAQ"
+    BTN_QQQ = "📉 QQQ"
+    BTN_LANGUAGE = "🌐 اللغة"
+    BTN_NOTIFICATIONS = "🔔 الإشعارات"
+    BTN_GUIDE = "📖 دليل الاستخدام"
+    BTN_FAQ = "❓ الأسئلة الشائعة"
+    BTN_ABOUT = "ℹ️ حول البوت"
 
     # ==========================================================
     # INITIALIZATION
     # ==========================================================
 
-    def __init__(self, channel_url: str, db):
+    def __init__(self, channel_url: str, db, owner_tg_id: int | None = None):
         self.channel_url = channel_url
         self.db = db
+        self.owner_tg_id = owner_tg_id
 
         self.formatter = InterfaceFormatter(channel_url=self.channel_url)
 
@@ -117,13 +140,37 @@ class BotInterface:
         يعيد: "owner" / "admin" / "user"
         يعتمد حصريًا على DatabaseManager.
         """
-        return self.db.get_user_role(user_id)
+        return self.db.get_user_role(user_id, owner_tg_id=self.owner_tg_id)
 
     def is_admin(self, user_id: int) -> bool:
         return self.get_user_role(user_id) in ("owner", "admin")
 
     def is_owner(self, user_id: int) -> bool:
         return self.get_user_role(user_id) == "owner"
+
+    def _is_admin_action(self, button_text: str) -> bool:
+        return button_text.startswith((
+            "المستخدم رقم",
+            self.BTN_ADMIN_APPROVE_REQUEST_PREFIX,
+            self.BTN_ADMIN_REJECT_REQUEST_PREFIX,
+        )) or button_text in {
+            self.BTN_ADMIN_PANEL,
+            self.BTN_ADMIN_USERS_LIST,
+            self.BTN_ADMIN_SEARCH_USER,
+            self.BTN_ADMIN_SUBSCRIPTIONS,
+            self.BTN_ADMIN_SUBSCRIBERS,
+            self.BTN_ADMIN_EXPIRED,
+            self.BTN_ADMIN_LOGS,
+            self.BTN_ADMIN_FREE_TRIAL,
+            self.BTN_ADMIN_SUBS_SETTINGS,
+            self.BTN_ADMIN_REQUESTS,
+        }
+
+    def _subscriber_access_state(self, user_id: int) -> str | None:
+        subscription = self.db.get_user_subscription_by_tg_id(user_id)
+        if subscription.get("status") == "active":
+            return None
+        return "EXPIRED_SUBSCRIPTION" if subscription.get("status") == "expired" else "SUBSCRIPTION_REQUIRED"
 
     # ==========================================================
     # MENUS — النسخة النهائية الصحيحة
@@ -148,47 +195,47 @@ class BotInterface:
     ]
 
     MARKET_MENU = [
-        ["📊 المؤشرات"],
-        ["🥇 الذهب", "₿ البيتكوين"],
-        ["📅 التقويم الاقتصادي"],
+        [BTN_INDICES],
+        [BTN_GOLD, BTN_BITCOIN],
+        [BTN_CALENDAR],
         [BTN_HOME]
     ]
 
     OPPORTUNITIES_MENU = [
-        ["🏆 الصفقات المكتملة"],
+        [BTN_COMPLETED_TRADES],
         [BTN_HOME]
     ]
 
     NEWS_MENU = [
-        ["🌅 ما قبل الافتتاح"],
-        ["🚨 الأخبار العاجلة"],
-        ["🌙 بعد الإغلاق"],
+        [BTN_NEWS_PREMARKET],
+        [BTN_NEWS_BREAKING],
+        [BTN_NEWS_AFTER_MARKET],
         [BTN_HOME]
     ]
 
     REPORTS_MENU = [
-        ["📅 التقرير اليومي"],
-        ["📈 التقرير الأسبوعي"],
-        ["📊 التقرير الشهري"],
+        [BTN_DAILY_REPORT],
+        [BTN_WEEKLY_REPORT],
+        [BTN_MONTHLY_REPORT],
         [BTN_HOME]
     ]
 
     ANALYSIS_MENU = [
-        ["📈 SPX", "📊 SPY"],
-        ["💻 NASDAQ", "📉 QQQ"],
+        [BTN_SPX, BTN_SPY],
+        [BTN_NASDAQ, BTN_QQQ],
         [BTN_HOME]
     ]
 
     SETTINGS_MENU = [
-        ["🌐 اللغة"],
-        ["🔔 الإشعارات"],
+        [BTN_LANGUAGE],
+        [BTN_NOTIFICATIONS],
         [BTN_HOME]
     ]
 
     HELP_MENU = [
-        ["📖 دليل الاستخدام"],
-        ["❓ الأسئلة الشائعة"],
-        ["ℹ️ حول البوت"],
+        [BTN_GUIDE],
+        [BTN_FAQ],
+        [BTN_ABOUT],
         [BTN_HOME]
     ]
 
@@ -305,10 +352,13 @@ class BotInterface:
 
     def open_menu(self, menu_name: str, user_id: int = 0):
         self.set_user_menu(user_id, menu_name)
-        return {
+        page = {
             "message": self.get_menu_message(menu_name),
             "keyboard": self.get_keyboard_layout(menu_name, user_id)
         }
+        if menu_name == self.MENU_CHANNEL:
+            page["parse_mode"] = "HTML"
+        return page
 
     # ==========================================================
     # SUBSCRIPTIONS — SMART PAGE
@@ -321,7 +371,7 @@ class BotInterface:
         self.db.set_subscription_mode(mode)
 
     def get_user_subscription(self, user_id: int):
-        return self.db.get_user_subscription(user_id)
+        return self.db.get_user_subscription_by_tg_id(user_id)
 
     def build_subscription_page(self, user_id: int):
         subscription = self.get_user_subscription(user_id)
@@ -329,9 +379,10 @@ class BotInterface:
         if subscription is None or subscription.get("status") == "none":
             message = self.formatter.build_subscription_plans_message()
             keyboard = [
-                [BTN_SUBS_GO_TO_STORE],
-                [BTN_BACK],
-                [BTN_HOME]
+                [self.BTN_SUBS_REQUEST_BIWEEKLY],
+                [self.BTN_SUBS_REQUEST_MONTHLY],
+                [self.BTN_BACK],
+                [self.BTN_HOME]
             ]
             return {"message": message, "keyboard": keyboard}
 
@@ -340,17 +391,18 @@ class BotInterface:
         if status == "active":
             message = self.formatter.build_subscription_status_message(subscription)
             keyboard = [
-                [BTN_SUBS_RENEW, BTN_SUBS_RESEND_INVITE],
-                [BTN_BACK],
-                [BTN_HOME]
+                [self.BTN_SUBS_RENEW, self.BTN_SUBS_RESEND_INVITE],
+                [self.BTN_BACK],
+                [self.BTN_HOME]
             ]
             return {"message": message, "keyboard": keyboard}
 
         message = self.formatter.build_subscription_expired_message(subscription)
         keyboard = [
-            [BTN_SUBS_RENEW, BTN_SUBS_GO_TO_STORE],
-            [BTN_BACK],
-            [BTN_HOME]
+            [self.BTN_SUBS_REQUEST_BIWEEKLY],
+            [self.BTN_SUBS_REQUEST_MONTHLY],
+            [self.BTN_BACK],
+            [self.BTN_HOME]
         ]
         return {"message": message, "keyboard": keyboard}
 
@@ -452,6 +504,26 @@ class BotInterface:
         keyboard = self.get_admin_subscription_settings_keyboard(mode)
         return {"message": message, "keyboard": keyboard}
 
+    def admin_open_subscription_requests(self):
+        """Show only pending requests and per-request guarded actions."""
+        rows = self.db.get_manual_subscription_requests()
+        message = self.formatter.build_admin_subscription_requests_message(rows)
+        keyboard = []
+        for request_id, *_rest in rows:
+            keyboard.append([
+                f"{self.BTN_ADMIN_APPROVE_REQUEST_PREFIX}{request_id}",
+                f"{self.BTN_ADMIN_REJECT_REQUEST_PREFIX}{request_id}",
+            ])
+        keyboard.extend(self.get_admin_subscriptions_keyboard())
+        return {"message": message, "keyboard": keyboard}
+
+    @staticmethod
+    def _request_id_from_admin_action(button_text: str, prefix: str):
+        try:
+            return int(button_text.removeprefix(prefix).strip())
+        except ValueError:
+            return None
+
     # ==========================================================
     # ADMIN — KEYBOARDS
     # ==========================================================
@@ -512,6 +584,16 @@ class BotInterface:
 
     def handle_button(self, button_text: str, first_name: str, user_id: int, card_type: str | None = None):
 
+        # Never rely on hiding a keyboard row as authorization.  Any text can
+        # be sent manually to Telegram, so every administrative action is
+        # checked again at the routing boundary.
+        if self._is_admin_action(button_text) or self.get_user_state(user_id) == "admin_search_user":
+            if not self.is_admin(user_id):
+                return {
+                    "message": self.formatter.build_service_state_message("ADMIN_REQUIRED"),
+                    "keyboard": self.get_main_menu(user_id),
+                }
+
         actions = {
             self.BTN_HOME: lambda: (
                 self.set_user_menu(user_id, self.MENU_MAIN),
@@ -540,6 +622,65 @@ class BotInterface:
         # تنفيذ الإجراء إذا كان الزر موجودًا في القاموس
         if button_text in actions:
             return actions[button_text]()
+
+        # ----------------------------------------------------------
+        # USER SERVICE ROUTES — no market/news engine is invoked here
+        # unless the underlying result is journal-backed and trustworthy.
+        # ----------------------------------------------------------
+        if button_text in {self.BTN_INDICES, self.BTN_GOLD, self.BTN_BITCOIN, self.BTN_CALENDAR}:
+            return self._service_response("WAITING_FOR_DATA_PROVIDER", user_id)
+
+        if button_text in {self.BTN_SPX, self.BTN_SPY, self.BTN_NASDAQ, self.BTN_QQQ}:
+            return self._service_response("WAITING_FOR_DATA_PROVIDER", user_id)
+
+        if button_text in {self.BTN_NEWS_PREMARKET, self.BTN_NEWS_BREAKING, self.BTN_NEWS_AFTER_MARKET}:
+            return self._service_response("TEMPORARILY_UNAVAILABLE", user_id)
+
+        if button_text == self.BTN_COMPLETED_TRADES:
+            denied = self._subscriber_access_state(user_id)
+            if denied:
+                return self._service_response(denied, user_id)
+            completed = self.db.get_completed_trade_summaries()
+            if not completed:
+                return self._service_response("NO_RESULTS", user_id)
+            lines = ["🏆 الصفقات المكتملة\n"]
+            for trade in completed:
+                lines.append(
+                    f"• {trade['symbol']} — {trade.get('direction') or '—'}\n"
+                    f"  أغلقت: {trade.get('closed_at') or 'غير متاح'}"
+                )
+            return {"message": "\n".join(lines), "keyboard": self.OPPORTUNITIES_MENU}
+
+        if button_text == self.BTN_DAILY_REPORT:
+            denied = self._subscriber_access_state(user_id)
+            if denied:
+                return self._service_response(denied, user_id)
+            from performance_engine import PerformanceEngine
+            report = PerformanceEngine(journal=self.db).get_daily_report()
+            if not report.get("total_trades"):
+                return self._service_response("NO_RESULTS", user_id)
+            return {
+                "message": (
+                    "📅 التقرير اليومي\n\n"
+                    f"إجمالي الإشارات المسجلة: {report['total_trades']}\n"
+                    f"TP1: {report['tp1']} | TP2: {report['tp2']} | TP3: {report['tp3']}\n"
+                    f"وقف الخسارة: {report['stop_loss']} | الصفقات المغلقة: {report['completed']}\n\n"
+                    "يعرض هذا الملخص أحداثًا مسجلة فقط."
+                ),
+                "keyboard": self.REPORTS_MENU,
+            }
+
+        if button_text in {self.BTN_WEEKLY_REPORT, self.BTN_MONTHLY_REPORT}:
+            return self._service_response("COMING_SOON", user_id)
+
+        if button_text in {self.BTN_LANGUAGE, self.BTN_NOTIFICATIONS, self.BTN_FAQ}:
+            return self._service_response("COMING_SOON", user_id)
+
+        if button_text == self.BTN_GUIDE:
+            return {"message": self.formatter.build_help_message(), "keyboard": self.HELP_MENU}
+
+        if button_text == self.BTN_ABOUT:
+            return {"message": self.formatter.build_welcome_message(first_name), "keyboard": self.HELP_MENU}
 
         # ADMIN PANEL — BUTTONS
 
@@ -598,23 +739,43 @@ class BotInterface:
             return self.admin_open_subscription_settings(user_id)
 
         if button_text == self.BTN_ADMIN_REQUESTS:
-            rows = self.db.get_manual_subscription_requests()
-            message = self.formatter.build_admin_subscription_requests_message(rows)
-            keyboard = self.get_admin_subscriptions_keyboard()
-            return {"message": message, "keyboard": keyboard}
+            return self.admin_open_subscription_requests()
+
+        if button_text.startswith(self.BTN_ADMIN_APPROVE_REQUEST_PREFIX):
+            request_id = self._request_id_from_admin_action(
+                button_text, self.BTN_ADMIN_APPROVE_REQUEST_PREFIX
+            )
+            success = bool(request_id is not None and self.db.approve_request(request_id))
+            return {
+                "message": self.formatter.build_subscription_request_action_message(
+                    "approve", request_id or 0, success
+                ),
+                "keyboard": self.get_admin_subscriptions_keyboard(),
+            }
+
+        if button_text.startswith(self.BTN_ADMIN_REJECT_REQUEST_PREFIX):
+            request_id = self._request_id_from_admin_action(
+                button_text, self.BTN_ADMIN_REJECT_REQUEST_PREFIX
+            )
+            success = bool(request_id is not None and self.db.reject_request(request_id))
+            return {
+                "message": self.formatter.build_subscription_request_action_message(
+                    "reject", request_id or 0, success
+                ),
+                "keyboard": self.get_admin_subscriptions_keyboard(),
+            }
 
         # SUBSCRIPTIONS — ACTION BUTTONS
 
         if button_text == self.BTN_SUBS_RENEW:
-            message = self.formatter.build_subscription_renew_placeholder_message()
-            keyboard = [
-                [self.BTN_BACK],
-                [self.BTN_HOME]
-            ]
-            return {"message": message, "keyboard": keyboard}
+            self.set_user_menu(user_id, self.MENU_SUBSCRIPTION_PAGE)
+            return self.build_subscription_page(user_id)
 
         if button_text == self.BTN_SUBS_RESEND_INVITE:
-            message = self.formatter.build_subscription_resend_invite_placeholder_message()
+            access_state = self._subscriber_access_state(user_id)
+            if access_state:
+                return self._service_response(access_state, user_id)
+            message = self.formatter.build_subscription_invite_unavailable_message()
             keyboard = [
                 [self.BTN_BACK],
                 [self.BTN_HOME]
@@ -622,12 +783,25 @@ class BotInterface:
             return {"message": message, "keyboard": keyboard}
 
         if button_text == self.BTN_SUBS_GO_TO_STORE:
-            message = self.formatter.build_subscription_store_message()
-            keyboard = [
-                [self.BTN_BACK],
-                [self.BTN_HOME]
-            ]
-            return {"message": message, "keyboard": keyboard}
+            return self._service_response("COMING_SOON", user_id)
+
+        plan_buttons = {
+            self.BTN_SUBS_REQUEST_BIWEEKLY: InterfaceFormatter.PLAN_BIWEEKLY,
+            self.BTN_SUBS_REQUEST_MONTHLY: InterfaceFormatter.PLAN_MONTHLY,
+        }
+        if button_text in plan_buttons:
+            result = self.db.create_subscription_request_by_tg_id(user_id, plan_buttons[button_text])
+            if result.get("created"):
+                return {
+                    "message": self.formatter.build_subscription_request_created_message(),
+                    "keyboard": [[self.BTN_HOME]],
+                }
+            if result.get("reason") == "pending_exists":
+                return {
+                    "message": self.formatter.build_subscription_request_pending_message(),
+                    "keyboard": [[self.BTN_HOME]],
+                }
+            return self._service_response("TEMPORARILY_UNAVAILABLE", user_id)
 
         # NAVIGATION BUTTONS
 
@@ -648,9 +822,12 @@ class BotInterface:
 
         # FALLBACK
 
+        return self.go_home(first_name, user_id)
+
+    def _service_response(self, state: str, user_id: int):
         return {
-            "message": self.formatter.build_under_development_message(),
-            "keyboard": self.get_keyboard_layout(self.get_user_menu(user_id), user_id)
+            "message": self.formatter.build_service_state_message(state),
+            "keyboard": self.get_keyboard_layout(self.get_user_menu(user_id), user_id),
         }
 
 

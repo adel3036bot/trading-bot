@@ -307,8 +307,8 @@ class TelegramEngine:
         else:
             if news_text:
                 if destination == getattr(self.api, "channel_id", CHAT_ID):
-                    return bool(self.api.send_message(news_text))
-                return bool(self.api.send_message(news_text, destination=destination))
+                    return bool(self.api.send_message(news_text, parse_mode="HTML"))
+                return bool(self.api.send_message(news_text, destination=destination, parse_mode="HTML"))
         return False
 
     def send_report_with_image(self, report_image_path: str, report_text: str) -> None:
