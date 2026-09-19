@@ -3,13 +3,28 @@
 # SCHEDULER TEST
 # ==================================================
 
+import builtins
+import sys
+
 from daily_scheduler import DailyScheduler
+
+
+def _safe_print(*args, **kwargs):
+    try:
+        builtins.print(*args, **kwargs)
+    except UnicodeEncodeError:
+        encoding = sys.stdout.encoding or "utf-8"
+        text = " ".join(str(value) for value in args)
+        builtins.print(text.encode(encoding, "backslashreplace").decode(encoding, "replace"), **kwargs)
+
+
+print = _safe_print
 
 # ==================================================
 # TEST
 # ==================================================
 
-def run_scheduler_test():
+def run_scheduler_diagnostic():
 
     print("\n======================================")
     print("ADEL SMART BOT")
@@ -22,19 +37,9 @@ def run_scheduler_test():
 
         print("✅ Scheduler Loaded")
 
-        print("\n========== PRE MARKET ==========\n")
-
-        scheduler.send_morning_analysis()
-
-        scheduler.send_morning_news()
-
-        print("✅ PRE MARKET PASS")
-
-        print("\n========== AFTER MARKET ==========\n")
-
-        scheduler.send_evening_report()
-
-        print("✅ AFTER MARKET PASS")
+        print("\n========== SAFE SCHEDULER DIAGNOSTIC ==========\n")
+        print(f"NYSE calendar available: {scheduler.session_calendar.available}")
+        print("No Telegram, news fetch, image render, or market-data request is performed.")
 
         print("\n======================================")
         print("🎉 SCHEDULER READY")
@@ -53,7 +58,5 @@ def run_scheduler_test():
 # ==================================================
 
 if __name__ == "__main__":
+    run_scheduler_diagnostic()
 
-    run_scheduler_test()
-
-    

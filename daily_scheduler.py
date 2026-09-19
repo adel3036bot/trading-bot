@@ -3,16 +3,35 @@
 # DAILY SCHEDULER — FINAL OPERATIONAL VERSION
 # ============================================================
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
+import builtins
 import contextlib
 import concurrent.futures
 import io
+import sys
 import threading
 import time as _runtime_time
 from telegram_bot.telegram_engine import TelegramEngine
 from news.news_engine import NewsEngine
 from performance_engine import PerformanceEngine
+from market.session_calendar import NyseSessionCalendar
+
+
+def _safe_console_print(*args, **kwargs):
+    """Never let a legacy emoji log abort Scheduler startup on Windows cp1256."""
+    try:
+        builtins.print(*args, **kwargs)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        text = " ".join(str(value) for value in args)
+        safe_text = text.encode(encoding, errors="backslashreplace").decode(encoding, errors="replace")
+        builtins.print(safe_text, **kwargs)
+
+
+# This module contains older Arabic/emoji diagnostic logs. Keep their output
+# non-fatal without changing service logic or user-facing Telegram text.
+print = _safe_console_print
 
 try:
     from images.image_engine import ImageEngine
@@ -38,6 +57,9 @@ class DailyScheduler:
         self.performance = PerformanceEngine(journal=getattr(self.news_engine, "journal", None))
         self.market_timezone = ZoneInfo("America/New_York")
         self.display_timezone = ZoneInfo("Asia/Riyadh")
+        self.session_calendar = NyseSessionCalendar()
+        self.report_journal = getattr(self.news_engine, "journal", None)
+        self._last_delivery_reason = None
 
         # ----------------------------------------------------
         # IMAGE ENGINE
@@ -192,6 +214,8 @@ class DailyScheduler:
 
     def send_structured(self, data, message_type="report"):
 
+        self._last_delivery_reason = None
+
         if not data:
             print("⚠️ EMPTY STRUCTURED DATA")
             return False
@@ -213,6 +237,7 @@ class DailyScheduler:
 
         def finish(result, failure_reason=None):
             success = bool(result)
+            self._last_delivery_reason = None if success else (failure_reason or "delivery_failed")
             if raw_news:
                 try:
                     if success:
@@ -288,7 +313,7 @@ class DailyScheduler:
                         image_path,
                         text
                     )
-                    return True if result is None else bool(result)
+                    return finish(True if result is None else bool(result), "report_image_delivery_failed")
 
             # ------------------------------------------------
             # Final fallback
@@ -308,100 +333,96 @@ class DailyScheduler:
 
             return finish(self.send_text_safe(text, destination=destination), "image_send_failed")
 
+    def _report_key(self, report_type, session, now=None):
+        now_ksa = self._now_ksa(now)
+        return f"{report_type}:{session}:{now_ksa.date().isoformat()}"
+
+    def _report_destination(self):
+        return getattr(getattr(self.telegram, "api", None), "channel_id", "DEFAULT")
+
+    def send_report_once(self, data, *, report_type, session, now=None):
+        """Deliver an existing report exactly once after a successful send.
+
+        Failed deliveries remain retryable. The journal is the source of truth;
+        in-memory flags only avoid repeated work in a running process.
+        """
+        report_key = self._report_key(report_type, session, now)
+        journal = self.report_journal
+        if journal is not None and journal.report_was_sent(report_key):
+            return True
+
+        now_ksa = self._now_ksa(now)
+        if journal is not None:
+            journal.record_report(
+                report_key, report_type, now_ksa.date(), now_ksa.date(),
+                status="READY", metadata={"session": session, "template": data.get("template")},
+            )
+
+        success = self.send_structured(data, message_type="report")
+        if journal is not None:
+            destination = self._report_destination()
+            reason = None if success else (self._last_delivery_reason or "report_delivery_failed")
+            journal.record_report_delivery(
+                report_key, destination, success=success, failure_reason=reason,
+                metadata={"session": session, "report_type": report_type},
+            )
+            journal.record_report(
+                report_key, report_type, now_ksa.date(), now_ksa.date(),
+                status="SENT" if success else "DELIVERY_FAILED",
+                metadata={"session": session, "template": data.get("template")},
+            )
+        return success
+
     # ========================================================
     # MARKET HOURS — SAUDI TIME
     # ========================================================
 
-    def is_morning_report_time(self):
-        now = datetime.now(self.display_timezone).time()
+    def _now_ksa(self, now=None):
+        value = now or datetime.now(self.display_timezone)
+        if value.tzinfo is None:
+            return value.replace(tzinfo=self.display_timezone)
+        return value.astimezone(self.display_timezone)
 
-        return (
-            time(10, 0)
-            <= now
-            <
-            time(10, 30)
-        )
+    def _market_phase(self, now=None):
+        return self.session_calendar.phase_at(self._now_ksa(now))
 
-    # --------------------------------------------------------
-
-    def is_full_pre_market(self):
-
-        now = datetime.now(self.display_timezone).time()
-
-        return (
-            time(14, 30)
-            <= now
-            <
-            time(15, 30)
-        )
+    def is_morning_report_time(self, now=None):
+        """Legacy 10:00 KSA report, allowed only on a real NYSE session day."""
+        now_ksa = self._now_ksa(now)
+        return self.session_calendar.session_for(now_ksa) is not None and time(10, 0) <= now_ksa.time() < time(10, 30)
 
     # --------------------------------------------------------
 
-    def is_pre_market(self):
-
-        now = datetime.now(self.display_timezone).time()
-
-        return (
-            time(15, 30)
-            <= now
-            <
-            time(16, 30)
-        )
+    def is_full_pre_market(self, now=None):
+        return self._market_phase(now) == "PREPARATION"
 
     # --------------------------------------------------------
 
-    def is_market_open(self):
-
-        now = datetime.now(self.display_timezone).time()
-
-        return (
-            time(16, 30)
-            <= now
-            <
-            time(23, 0)
-        )
+    def is_pre_market(self, now=None):
+        return self._market_phase(now) == "PRE_MARKET"
 
     # --------------------------------------------------------
 
-    def is_after_market(self):
-
-        now = datetime.now(self.display_timezone).time()
-
-        return (
-            now >= time(23, 0)
-            or
-            now < time(0, 30)
-        )
+    def is_market_open(self, now=None):
+        return self._market_phase(now) == "MARKET_OPEN"
 
     # --------------------------------------------------------
 
-    def is_sleep_time(self):
+    def is_after_market(self, now=None):
+        return self._market_phase(now) == "AFTER_MARKET"
 
-        now = datetime.now(self.display_timezone).time()
+    # --------------------------------------------------------
 
-        return (
-            (
-                time(0, 30)
-                <= now
-                <
-                time(10, 0)
-            )
-            or
-            (
-                time(10, 30)
-                <= now
-                <
-                time(14, 30)
-            )
-        )
+    def is_sleep_time(self, now=None):
+        return self._market_phase(now) in {"CLOSED", "SLEEP"}
 
     # ========================================================
     # OPERATIONAL DAY RESET
     # ========================================================
 
-    def reset_daily_flags(self):
+    def reset_daily_flags(self, now=None):
 
-        now = datetime.now(self.display_timezone)
+        now = self._now_ksa(now)
 
         # 00:00–00:30 belongs to previous operational day.
         if now.time() >= time(0, 30):
@@ -886,9 +907,10 @@ class DailyScheduler:
             image_data["title"] = "🌅 التقرير الصباحي"
             image_data["session"] = "MORNING"
 
-            success = self.send_structured(
+            success = self.send_report_once(
                 data,
-                message_type="report"
+                report_type="MORNING_REPORT",
+                session="MORNING",
             )
 
             if success:
@@ -1514,7 +1536,7 @@ class DailyScheduler:
                             ),
 
                         "win_rate":
-                            0,
+                            None,
 
                         "best_trade":
                             (
@@ -1530,10 +1552,10 @@ class DailyScheduler:
                             "",
 
                         "total_profit":
-                            0,
+                            None,
 
                         "total_loss":
-                            0,
+                            None,
 
                         "summary":
                             (
@@ -1562,11 +1584,10 @@ class DailyScheduler:
                         report_text
                 }
 
-                success = (
-                    self.send_structured(
-                        report_data,
-                        message_type="report"
-                    )
+                success = self.send_report_once(
+                    report_data,
+                    report_type="PRE_MARKET_STATUS",
+                    session="PRE_MARKET",
                 )
 
                 if success:
@@ -1843,30 +1864,18 @@ class DailyScheduler:
 
                 return False
 
-            report_success = self.send_structured(
+            report_success = self.send_report_once(
                 data,
-                message_type="report"
+                report_type="EVENING_PERFORMANCE",
+                session="AFTER_MARKET",
             )
 
+            # Live news delivery has not yet been verified end-to-end.  Keep
+            # the report lifecycle reachable, but do not turn any future
+            # after_items into unverified news messages.
             news_success = True
-
             if after_items:
-
-                print(
-                    "📰 SENDING AFTER-MARKET "
-                    "DETAILED NEWS"
-                )
-
-                for item in after_items:
-
-                    success = self.send_structured(
-                        item,
-                        message_type="news"
-                    )
-
-                    if not success:
-
-                        news_success = False
+                print("📰 AFTER-MARKET NEWS WAITING_FOR_NEWS")
 
             if (
                 report_success
@@ -1892,18 +1901,26 @@ class DailyScheduler:
     # MAIN SCHEDULER LOOP
     # ========================================================
 
-    def run(self):
+    def run(self, now=None):
 
         try:
 
-            self.reset_daily_flags()
+            now_ksa = self._now_ksa(now)
+            self.reset_daily_flags(now_ksa)
+
+            # A holiday/weekend has no trading-session reports or signals.
+            # Background collection may continue, but it cannot turn a closed
+            # NYSE date into MARKET_OPEN.
+            if self.session_calendar.session_for(now_ksa) is None:
+                self.collect_sleep_data()
+                return "SLEEP"
 
             # ------------------------------------------------
             # 10:00
             # MORNING REPORT
             # ------------------------------------------------
 
-            if self.is_morning_report_time():
+            if self.is_morning_report_time(now_ksa):
 
                 self.send_morning_report()
 
@@ -1915,7 +1932,7 @@ class DailyScheduler:
             # No report is sent at this time.
             # ------------------------------------------------
 
-            if self.is_full_pre_market():
+            if self.is_full_pre_market(now_ksa):
 
                 self.start_premarket_preparation()
 
@@ -1934,13 +1951,12 @@ class DailyScheduler:
             # Therefore we process news but return SLEEP.
             # ------------------------------------------------
 
-            if self.is_pre_market():
+            if self.is_pre_market(now_ksa):
 
                 self.send_morning_news()
 
-                now = datetime.now().time()
-
-                if now >= time(16, 20):
+                session = self.session_calendar.session_for(now_ksa)
+                if session and now_ksa >= session.market_open_ksa - timedelta(minutes=10):
                     self._warm_market_cache_before_open()
 
                 return "SLEEP"
@@ -1950,7 +1966,7 @@ class DailyScheduler:
             # MARKET OPEN
             # ------------------------------------------------
 
-            if self.is_market_open():
+            if self.is_market_open(now_ksa):
 
                 return "MARKET_OPEN"
 
@@ -1959,17 +1975,17 @@ class DailyScheduler:
             # EVENING / AFTER MARKET
             # ------------------------------------------------
 
-            if self.is_after_market():
+            if self.is_after_market(now_ksa):
 
                 self.send_evening_report()
 
-                return "SLEEP"
+                return "AFTER_MARKET"
 
             # ------------------------------------------------
             # SLEEP
             # ------------------------------------------------
 
-            if self.is_sleep_time():
+            if self.is_sleep_time(now_ksa):
 
                 self.collect_sleep_data()
 

@@ -35,7 +35,8 @@ class TelegramApp:
         self,
         token: str,
         channel_url: str,
-        admin_id: int
+        admin_id: int,
+        db: DatabaseManager | None = None,
     ):
 
         self.token = token
@@ -43,7 +44,9 @@ class TelegramApp:
         self.admin_id = admin_id   # يبقى للتوافق مع AdelSmartBot.py
 
         # إنشاء قاعدة البيانات
-        self.db = DatabaseManager()
+        # Runtime composition injects the process journal.  The fallback
+        # preserves direct construction in existing tests/tools.
+        self.db = db or DatabaseManager()
 
         # إنشاء تطبيق تيليجرام
         self.application = (

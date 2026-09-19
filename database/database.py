@@ -698,6 +698,42 @@ class DatabaseManager:
         finally:
             conn.close()
 
+    def record_report_delivery(self, report_key, destination, *, success=False, failure_reason=None, metadata=None):
+        """Persist delivery attempts independently from the report's facts."""
+        conn = self.connect()
+        try:
+            if conn.execute("SELECT 1 FROM report_journal WHERE report_key = ?", (report_key,)).fetchone() is None:
+                raise ValueError("report_journal_not_found")
+            cur = conn.execute("""
+                INSERT INTO report_deliveries
+                (report_key, destination, attempted_at, success, failure_reason, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                report_key, str(destination), self.now().isoformat(), int(bool(success)),
+                failure_reason, self._json(metadata or {}),
+            ))
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+    def get_report_deliveries(self, report_key):
+        conn = self.connect()
+        try:
+            rows = conn.execute("""
+                SELECT destination, attempted_at, success, failure_reason, metadata_json
+                FROM report_deliveries WHERE report_key = ? ORDER BY id
+            """, (report_key,)).fetchall()
+            return [
+                {
+                    "destination": row[0], "attempted_at": row[1], "success": bool(row[2]),
+                    "failure_reason": row[3], "metadata": json.loads(row[4] or "{}"),
+                }
+                for row in rows
+            ]
+        finally:
+            conn.close()
+
     def get_signal_journal(self, signal_id: str):
         conn = self.connect()
         try:

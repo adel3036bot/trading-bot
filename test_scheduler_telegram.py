@@ -8,9 +8,24 @@
 # يرسل رسالة Telegram اختبارية واحدة فقط
 # ============================================================
 
+import os
+import builtins
+import sys
 import daily_scheduler
 from datetime import datetime as RealDateTime
 from daily_scheduler import DailyScheduler
+
+
+def _safe_print(*args, **kwargs):
+    try:
+        builtins.print(*args, **kwargs)
+    except UnicodeEncodeError:
+        encoding = sys.stdout.encoding or "utf-8"
+        text = " ".join(str(value) for value in args)
+        builtins.print(text.encode(encoding, "backslashreplace").decode(encoding, "replace"), **kwargs)
+
+
+print = _safe_print
 
 
 # ============================================================
@@ -111,6 +126,10 @@ def test_scheduler_time_logic():
 
 def test_telegram_send():
 
+    if os.getenv("ADEL_ALLOW_LIVE_TELEGRAM_TEST") != "1":
+        print("LIVE TELEGRAM TEST SKIPPED: set ADEL_ALLOW_LIVE_TELEGRAM_TEST=1 explicitly.")
+        return False
+
     print("\n" + "=" * 65)
     print("ADEL SMART BOT - TELEGRAM REAL SEND TEST")
     print("=" * 65)
@@ -156,7 +175,7 @@ if __name__ == "__main__":
     print("🚀 STARTING DIAGNOSTIC TEST")
     print("⚠️ لا يوجد تعديل على ملفات البوت الأصلية.")
     print("⚠️ لا يوجد إرسال لتقرير حقيقي.")
-    print("⚠️ سيتم إرسال رسالة Telegram اختبارية واحدة فقط.")
+    print("Live Telegram delivery is disabled unless ADEL_ALLOW_LIVE_TELEGRAM_TEST=1.")
 
     # 1 — اختبار منطق Scheduler
     test_scheduler_time_logic()
@@ -167,4 +186,3 @@ if __name__ == "__main__":
     print("\n" + "=" * 65)
     print("🎉 ALL DIAGNOSTIC TESTS FINISHED")
     print("=" * 65)
-    

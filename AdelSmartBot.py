@@ -2181,42 +2181,31 @@ def show_top_signals(session: str, news_engine: NewsEngine, telegram: TelegramEn
 # MAIN
 # ==================================================
 
-if __name__ == "__main__":
+def run_application(preflight_report=None) -> int:
+    """Run only the explicitly composed runtime services.
 
-    print("🚀 ADEL SMART BOT STARTED")
+    Legacy scan/send helpers remain available for manual compatibility, but
+    are deliberately not scheduled until a verified live data provider exists.
+    """
+    from core.runtime_health import ServiceState
+    from core.runtime_services import build_runtime_services
+    from core.startup_preflight import run_preflight
 
-    telegram = TelegramEngine()
-    news_engine = NewsEngine()
-    scheduler = DailyScheduler(telegram=telegram, news_engine=news_engine)
+    report = preflight_report or run_preflight()
+    if not report.ok:
+        print(report.safe_summary())
+        return 1
 
-    def send_legacy_news(items):
-        """Compatibility path: preserve text-only delivery while journaling it."""
-        destination = telegram.news_destination() if hasattr(telegram, "news_destination") else None
-        for item in items or []:
-            raw = item.get("raw") if isinstance(item, dict) else None
-            text = item.get("message", "") if isinstance(item, dict) else ""
-            try:
-                success = telegram.send_message(text, destination=destination)
-            except Exception as error:
-                success = False
-                logging.error("Legacy news delivery failed: %s", error)
-            if success:
-                news_engine.mark_as_sent(raw, destination=destination or "DEFAULT")
-            else:
-                news_engine.record_delivery_failure(raw, destination=destination or "DEFAULT")
-
-    # ==================================================
-    # TELEGRAM USER INTERFACE
-    # ==================================================
-
-    telegram_ui = TelegramApp(
+    services = build_runtime_services(
         token=BOT_TOKEN,
         channel_url=CHANNEL_URL,
-        admin_id=ADMIN_ID
+        admin_id=ADMIN_ID,
+        health=report.health,
     )
+    print("ADEL SMART BOT STARTED")
 
     ui_thread = threading.Thread(
-        target=lambda: telegram_ui.get_application().run_polling(
+        target=lambda: services.interface.get_application().run_polling(
             drop_pending_updates=True
         ),
         daemon=True
@@ -2232,43 +2221,30 @@ if __name__ == "__main__":
 
         try:
 
-            status = scheduler.run()
+            status = services.scheduler.run()
 
             if status == "MARKET_OPEN":
-
-                print("📈 MARKET OPEN MODE")
-
-                show_top_signals("MARKET_OPEN", news_engine, telegram)
-
-                send_legacy_news(news_engine.breaking_news())
-
-            elif status == "PRE_MARKET":
-
-                print("🌅 PRE MARKET MODE")
-
-                show_top_signals("PRE_MARKET", news_engine, telegram)
-
-                send_legacy_news(news_engine.morning_news())
+                # No verified live quotes / Option Chain means no legacy scan,
+                # no direct Telegram signal, and no implied live service.
+                services.health.set("market_data", ServiceState.WAITING_FOR_DATA_PROVIDER)
+                print("MARKET OPEN: WAITING_FOR_DATA_PROVIDER")
 
             elif status == "AFTER_MARKET":
-
-                print("📊 AFTER MARKET MODE")
-
-                show_top_signals("AFTER_MARKET", news_engine, telegram)
-
-                send_legacy_news(news_engine.after_market_news())
+                print("AFTER MARKET: WAITING_FOR_NEWS_VERIFICATION")
 
             else:
+                print("MARKET CLOSED")
 
-                print("🌙 MARKET CLOSED")
-
-            print("⏳ Waiting 60 seconds...")
+            print("Waiting 60 seconds...")
             time.sleep(60)
 
         except Exception as e:
-
-            print("ERROR:", e)
+            logging.exception("Runtime loop error: %s", e)
             time.sleep(60)
 
-            
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_application())
 
